@@ -30,12 +30,22 @@ def load_data(data_path="data/iris/iris.data"):
     y = df.iloc[:, -1].values
     return X, y
 
+def sample_labels(probs, ensemble_size=10, random_state=42):
+    rng = np.random.default_rng(random_state)
+    n_samples, n_classes = probs.shape
+    labels = np.array([
+        rng.choice(n_classes, size=ensemble_size, p=p) for p in probs
+    ])
+    return labels
+
 def pipeline(test_size=0.3, random_state=42):
     X, y = load_data()
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state)
     model = train_model(X_train, y_train)
     probs = predict(model, X_test)
     entropy_histogram(probs)
+
+    sampled_labels = sample_labels(probs)
 
 
 def main():
