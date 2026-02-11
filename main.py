@@ -18,7 +18,8 @@ def predict(model, X):
 
 
 def entropy_histogram(probs, bins=10, save_path="out/entropy_histogram.png", dataset_title="Dataset"):
-    ent = -np.sum(probs * np.log(probs + 1e-12), axis=1)
+    K = probs.shape[1]
+    ent = -np.sum(probs * np.log(probs + 1e-12) / np.log(K), axis=1)
     plt.hist(ent, bins=bins)
     plt.xlabel("Entropy")
     plt.ylabel("Count")
