@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.frozen import FrozenEstimator
+from sklearn.preprocessing import LabelEncoder
 from probly.metrics import coverage_convex_hull
 
 
@@ -24,7 +27,6 @@ def entropy_histogram(probs, bins=10, save_path="out/entropy_histogram.png", dat
     plt.xlabel("Entropy")
     plt.ylabel("Count")
     plt.title(f"Prediction Entropy Distribution ({dataset_title})")
-    plt.show()
     plt.savefig(save_path)
 
 
@@ -49,23 +51,60 @@ def sample_labels_single(probs, random_state=42):
     return labels
 
 
+def fit_isotonic_calibrator(base_model, X_calib, y_calib):
+    calibrator = CalibratedClassifierCV(
+        estimator=FrozenEstimator(base_model),
+        method="isotonic",
+    )
+    calibrator.fit(X_calib, y_calib)
+    return calibrator
+
+    
+
 def pipeline(
     data_path="data/iris/iris.data",
     label_column=-1,
     test_size=0.3,
+    calibration_size=0.25,
     ensemble_size=10,
     sampling_mode="per_model",
     random_state=42,
 ):
     X, y = load_data(data_path=data_path, label_column=label_column)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state
-    )
-    model = train_model(X_train, y_train)
-    probs_test = predict(model, X_test)
-    entropy_histogram(probs_test, save_path=f"out/entropy_histogram_{data_path.split('/')[-2]}.png", dataset_title = data_path.split('/')[-2])
+    encoder = LabelEncoder()
+    y = encoder.fit_transform(y)
 
-    probs_train = predict(model, X_train)
+    X_train_full, X_test, y_train_full, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y
+    )
+
+    if calibration_size > 0:
+        X_train, X_calib, y_train, y_calib = train_test_split(
+            X_train_full,
+            y_train_full,
+            test_size=calibration_size,
+            random_state=random_state,
+            stratify=y_train_full,
+        )
+    else:
+        X_train, y_train = X_train_full, y_train_full
+    
+    base_model = train_model(X_train, y_train)
+
+    if calibration_size > 0:
+        calibrated_model = fit_isotonic_calibrator(base_model, X_calib, y_calib)
+        probs_test = predict(calibrated_model, X_test)
+        probs_train = predict(calibrated_model, X_train)
+    else:
+        probs_test = predict(base_model, X_test)
+        probs_train = predict(base_model, X_train)
+
+    entropy_histogram(
+        probs_test,
+        save_path=f"out/entropy_histogram_{data_path.split('/')[-2]}.png",
+        dataset_title=data_path.split('/')[-2],
+    )
+
     if sampling_mode == "per_model":
         sampled_labels = sample_labels(
             probs_train, ensemble_size=ensemble_size, random_state=random_state
@@ -131,8 +170,9 @@ if __name__ == "__main__":
         "data_path": "data/wine/wine.data",
         "label_column": 0,  # -1 for iris, 0 for wine and abalone
         "test_size": 0.3,
+        "calibration_size": 0.0,
         "ensemble_size": 25,
-        "random_state": 42,
+        "random_state": 43,
         "sampling_mode": "shared",  # "per_model" or "shared"
     }
     pipeline(**arguments)
