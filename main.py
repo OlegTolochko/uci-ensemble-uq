@@ -34,7 +34,9 @@ def predict(model, X):
     return model.predict_proba(X)
 
 
-def entropy_histogram(probs, bins=10, save_path="out/entropy_histogram.png", dataset_title="Dataset"):
+def entropy_histogram(
+    probs, bins=10, save_path="out/entropy_histogram.png", dataset_title="Dataset"
+):
     K = probs.shape[1]
     ent = -np.sum(probs * np.log(probs + 1e-12) / np.log(K), axis=1)
     plt.hist(ent, bins=bins)
@@ -73,7 +75,6 @@ def fit_isotonic_calibrator(base_model, X_calib, y_calib):
     calibrator.fit(X_calib, y_calib)
     return calibrator
 
-    
 
 def pipeline(
     data_path="data/iris/iris.data",
@@ -103,7 +104,7 @@ def pipeline(
         )
     else:
         X_train, y_train = X_train_full, y_train_full
-    
+
     model = train_model(X_train, y_train, model_type=base_model)
 
     if calibration_size > 0 and base_model != "tabpfn":
@@ -117,7 +118,7 @@ def pipeline(
     entropy_histogram(
         probs_test,
         save_path=f"out/entropy_histogram_{data_path.split('/')[-2]}.png",
-        dataset_title=data_path.split('/')[-2],
+        dataset_title=data_path.split("/")[-2],
     )
 
     y_pred_test = np.argmax(probs_test, axis=1)
@@ -185,7 +186,7 @@ def check_convex_hull_coverage(ensemble, X_test, targets, n_classes):
 
 if __name__ == "__main__":
     arguments = {
-        "base_model": "tabpfn", # "logistic" or "tabpfn"
+        "base_model": "tabpfn",  # "logistic" or "tabpfn"
         "data_path": "data/wine/wine.data",
         "label_column": 0,  # -1 for iris and pendigits, 0 for wine, abalone and letter-recognition
         "test_size": 0.3,
