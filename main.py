@@ -1,18 +1,32 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.base import BaseEstimator
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
 from sklearn.preprocessing import LabelEncoder
+from tabpfn import TabPFNClassifier
 from probly.metrics import coverage_convex_hull
+from sklearn.metrics import accuracy_score
+from tabpfn_extensions.many_class import ManyClassClassifier
 
 
-def train_model(X, y):
-    model = LogisticRegression()
+def _fit_logistic(X, y):
+    model = LogisticRegression(max_iter=1000)
     model.fit(X, y)
+    return model
+
+
+def train_model(X, y, model_type="logistic"):
+    if model_type == "tabpfn":
+        base = TabPFNClassifier(ignore_pretraining_limits=True)
+        model = ManyClassClassifier(estimator=base, alphabet_size=10)
+        model.fit(X, y)
+    else:
+        model = _fit_logistic(X, y)
     return model
 
 
@@ -64,6 +78,7 @@ def fit_isotonic_calibrator(base_model, X_calib, y_calib):
 def pipeline(
     data_path="data/iris/iris.data",
     label_column=-1,
+    base_model="logistic",
     test_size=0.3,
     calibration_size=0.25,
     ensemble_size=10,
@@ -89,21 +104,24 @@ def pipeline(
     else:
         X_train, y_train = X_train_full, y_train_full
     
-    base_model = train_model(X_train, y_train)
+    model = train_model(X_train, y_train, model_type=base_model)
 
-    if calibration_size > 0:
-        calibrated_model = fit_isotonic_calibrator(base_model, X_calib, y_calib)
-        probs_test = predict(calibrated_model, X_test)
-        probs_train = predict(calibrated_model, X_train)
+    if calibration_size > 0 and base_model != "tabpfn":
+        calibrated = fit_isotonic_calibrator(model, X_calib, y_calib)
+        probs_test = predict(calibrated, X_test)
+        probs_train = predict(calibrated, X_train)
     else:
-        probs_test = predict(base_model, X_test)
-        probs_train = predict(base_model, X_train)
+        probs_test = predict(model, X_test)
+        probs_train = predict(model, X_train)
 
     entropy_histogram(
         probs_test,
         save_path=f"out/entropy_histogram_{data_path.split('/')[-2]}.png",
         dataset_title=data_path.split('/')[-2],
     )
+
+    y_pred_test = np.argmax(probs_test, axis=1)
+    print(f"Base model accuracy: {accuracy_score(y_test, y_pred_test):.3f}")
 
     if sampling_mode == "per_model":
         sampled_labels = sample_labels(
@@ -167,12 +185,13 @@ def check_convex_hull_coverage(ensemble, X_test, targets, n_classes):
 
 if __name__ == "__main__":
     arguments = {
+        "base_model": "tabpfn", # "logistic" or "tabpfn"
         "data_path": "data/wine/wine.data",
-        "label_column": 0,  # -1 for iris, 0 for wine and abalone
+        "label_column": 0,  # -1 for iris and pendigits, 0 for wine, abalone and letter-recognition
         "test_size": 0.3,
         "calibration_size": 0.0,
         "ensemble_size": 25,
-        "random_state": 43,
+        "random_state": 42,
         "sampling_mode": "shared",  # "per_model" or "shared"
     }
     pipeline(**arguments)

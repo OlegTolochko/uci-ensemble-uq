@@ -10,5 +10,7 @@ dependencies = [
     "pandas>=3.0.0",
     "probly>=0.3.1",
     "ruff>=0.15.0",
-    "scikit-learn>=1.8.0",
+    "scikit-learn>=1.6,<1.7",
+    "tabpfn>=2.0.3",
+    "tabpfn-extensions[many-classes]>=0.0.4",
 ]
