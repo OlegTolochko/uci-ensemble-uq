@@ -1,3 +1,4 @@
+import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -12,6 +13,8 @@ from tabpfn import TabPFNClassifier
 from probly.metrics import coverage_convex_hull
 from sklearn.metrics import accuracy_score
 from tabpfn_extensions.many_class import ManyClassClassifier
+
+warnings.filterwarnings("ignore")
 
 
 def _fit_logistic(X, y):
@@ -39,17 +42,33 @@ def entropy_histogram(
 ):
     K = probs.shape[1]
     ent = -np.sum(probs * np.log(probs + 1e-12) / np.log(K), axis=1)
+    plt.figure()
     plt.hist(ent, bins=bins)
     plt.xlabel("Entropy")
     plt.ylabel("Count")
     plt.title(f"Prediction Entropy Distribution ({dataset_title})")
     plt.savefig(save_path)
+    plt.close()
 
 
-def load_data(data_path="data/iris/iris.data", label_column=-1):
-    df = pd.read_csv(data_path, header=None)
+def load_data(data_path="data/iris/iris.data", label_column=-1, sep=None, header=None, 
+              usecols=None, id_column=None, encode_first_column=False):
+    df = pd.read_csv(data_path, sep=sep, header=header)
+    
+    if id_column is not None:
+        df = df.drop(columns=df.columns[id_column])
+    
+    if encode_first_column:
+        first_col = df.columns[0]
+        if df[first_col].dtype == object or str(df[first_col].dtype) == 'str':
+            le = LabelEncoder()
+            df[first_col] = le.fit_transform(df[first_col])
+    
+    if usecols is not None:
+        df = df[usecols]
+    
     y = df.iloc[:, label_column].values
-    X = df.drop(columns=df.columns[label_column]).values
+    X = df.drop(columns=df.columns[label_column]).values.astype(float)
     return X, y
 
 
@@ -76,6 +95,12 @@ def fit_isotonic_calibrator(base_model, X_calib, y_calib):
     return calibrator
 
 
+def can_stratify(y, test_size):
+    _, counts = np.unique(y, return_counts=True)
+    min_samples_needed = 2 if test_size < 1 else 1
+    return all(c >= min_samples_needed for c in counts)
+
+
 def pipeline(
     data_path="data/iris/iris.data",
     label_column=-1,
@@ -85,22 +110,35 @@ def pipeline(
     ensemble_size=10,
     sampling_mode="per_model",
     random_state=42,
+    sep=None,
+    header=None,
+    id_column=None,
+    encode_first_column=False,
 ):
-    X, y = load_data(data_path=data_path, label_column=label_column)
+    X, y = load_data(
+        data_path=data_path, 
+        label_column=label_column,
+        sep=sep,
+        header=header,
+        id_column=id_column,
+        encode_first_column=encode_first_column,
+    )
     encoder = LabelEncoder()
     y = encoder.fit_transform(y)
 
+    use_stratify = can_stratify(y, test_size)
     X_train_full, X_test, y_train_full, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y
+        X, y, test_size=test_size, random_state=random_state, stratify=y if use_stratify else None
     )
 
     if calibration_size > 0:
+        use_stratify_calib = can_stratify(y_train_full, calibration_size)
         X_train, X_calib, y_train, y_calib = train_test_split(
             X_train_full,
             y_train_full,
             test_size=calibration_size,
             random_state=random_state,
-            stratify=y_train_full,
+            stratify=y_train_full if use_stratify_calib else None,
         )
     else:
         X_train, y_train = X_train_full, y_train_full
@@ -115,14 +153,16 @@ def pipeline(
         probs_test = predict(model, X_test)
         probs_train = predict(model, X_train)
 
+    dataset_name = data_path.split("/")[-2]
     entropy_histogram(
         probs_test,
-        save_path=f"out/entropy_histogram_{data_path.split('/')[-2]}.png",
-        dataset_title=data_path.split("/")[-2],
+        save_path=f"out/entropy_histogram_{dataset_name}_{base_model}.png",
+        dataset_title=f"{dataset_name} ({base_model})",
     )
 
     y_pred_test = np.argmax(probs_test, axis=1)
-    print(f"Base model accuracy: {accuracy_score(y_test, y_pred_test):.3f}")
+    accuracy = accuracy_score(y_test, y_pred_test)
+    print(f"Base model accuracy: {accuracy:.3f}")
 
     if sampling_mode == "per_model":
         sampled_labels = sample_labels(
@@ -143,7 +183,8 @@ def pipeline(
     classes = np.unique(y)
     n_classes = len(classes)
 
-    check_convex_hull_coverage(ensemble, X_test, probs_test, n_classes=n_classes)
+    convex_hull_cov = check_convex_hull_coverage(ensemble, X_test, probs_test, n_classes=n_classes)
+    return accuracy, convex_hull_cov
 
 
 def train_ensemble(X, y_ensemble, random_state=42):
