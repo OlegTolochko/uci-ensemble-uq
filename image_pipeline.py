@@ -1,0 +1,674 @@
+"""Image pipeline for soft-label classification.
+
+Pipeline:
+1. Read `annotations.json`.
+2. For each image, count how many annotators picked each class.
+3. Turn those vote counts into a probability distribution.
+4. Use the dataset's predefined folds as the train/test split.
+5. Split only the training folds again into train/validation.
+6. Train a classifier with soft-target cross entropy.
+7. Average member probabilities if an ensemble is requested.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import math
+import random
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import torch
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from torchvision.models import get_model, get_model_weights
+
+
+torch.set_float32_matmul_precision("high")
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+DEFAULT_ENCODERS = {
+    "resnet18": 224,
+    "resnet50": 224,
+    "efficientnet_b0": 224,
+    "convnext_tiny": 224,
+    "vit_b_16": 224,
+}
+
+
+@dataclass(slots=True)
+class ImageRecord:
+    image_path: str
+    fold: str # e.g. `fold0`, `fold1`, etc.
+    target_probs: np.ndarray # e.g. [0.1, 0.8, 0.1]
+
+
+@dataclass(slots=True)
+class ImageExperimentConfig:
+    data_root: Path = Path("data/image")
+    output_root: Path = Path("out/image")
+    encoder_name: str = "resnet18"
+    pretrained: bool = True
+    freeze_encoder: bool = True
+    ensemble_size: int = 5
+    batch_size: int = 32
+    epochs: int = 10
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    validation_size: float = 0.1
+    early_stopping_patience: int = 4
+    bootstrap_members: bool = True
+    num_workers: int = 4
+    device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    seed: int = 42
+    max_train_samples: int | None = None
+    max_test_samples: int | None = None
+    folds: list[str] | None = None
+    input_size: int | None = None
+    save_member_predictions: bool = True
+
+
+@dataclass(slots=True)
+class FoldResult:
+    test_fold: str
+    train_size: int
+    val_size: int
+    test_size: int
+    member_cross_entropies: list[float]
+    ensemble_cross_entropy: float
+    prediction_file: str
+    member_prediction_files: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "test_fold": self.test_fold,
+            "train_size": self.train_size,
+            "val_size": self.val_size,
+            "test_size": self.test_size,
+            "member_cross_entropies": self.member_cross_entropies,
+            "ensemble_cross_entropy": self.ensemble_cross_entropy,
+            "prediction_file": self.prediction_file,
+            "member_prediction_files": self.member_prediction_files,
+        }
+
+
+@dataclass(slots=True)
+class DatasetResult:
+    dataset_name: str
+    encoder_name: str
+    class_names: list[str]
+    folds: list[FoldResult]
+    mean_member_cross_entropy: float
+    mean_ensemble_cross_entropy: float
+    config: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dataset_name": self.dataset_name,
+            "encoder_name": self.encoder_name,
+            "class_names": self.class_names,
+            "mean_member_cross_entropy": self.mean_member_cross_entropy,
+            "mean_ensemble_cross_entropy": self.mean_ensemble_cross_entropy,
+            "config": self.config,
+            "folds": [fold.to_dict() for fold in self.folds],
+        }
+
+
+class SoftLabelImageDataset(Dataset):
+    """Wrapper that loads images and returns soft targets"""
+
+    def __init__(
+        self,
+        data_root: Path,
+        records: list[ImageRecord],
+        transform: transforms.Compose,
+    ) -> None:
+        self.data_root = data_root
+        self.records = records
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, str]:
+        record = self.records[index]
+        image = Image.open(self.data_root / record.image_path).convert("RGB")
+        target = torch.tensor(record.target_probs, dtype=torch.float32)
+        return self.transform(image), target, record.image_path
+
+
+class SoftTargetCrossEntropy(nn.Module):
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        log_probs = torch.log_softmax(logits, dim=1)
+        return -(targets * log_probs).sum(dim=1).mean()
+
+
+class TorchvisionSoftClassifier(nn.Module):
+    """Torchvision encoder with a new linear head."""
+    def __init__(
+        self,
+        encoder_name: str,
+        num_classes: int,
+        pretrained: bool,
+        freeze_encoder: bool,
+    ) -> None:
+        super().__init__()
+
+        weights = None
+        if pretrained:
+            weights = get_model_weights(encoder_name).DEFAULT
+
+        self.encoder = get_model(encoder_name, weights=weights)
+        in_features = replace_classification_head_with_identity(self.encoder)
+        self.head = nn.Linear(in_features, num_classes)
+
+        if freeze_encoder:
+            for parameter in self.encoder.parameters():
+                parameter.requires_grad = False
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        features = self.encoder(images)
+        if features.ndim > 2:
+            features = torch.flatten(features, start_dim=1)
+        return self.head(features)
+
+
+def discover_image_datasets(data_root: Path) -> list[str]:
+    return sorted(path.name for path in data_root.iterdir() if path.is_dir())
+
+
+def load_image_dataset(dataset_dir: Path) -> tuple[list[str], list[ImageRecord]]:
+    """Load a dataset and convert annotator votes into soft labels.
+    Example:
+    - votes: `cat=8`, `dog=2`
+    - target distribution: `[0.8, 0.2]`
+    """
+
+    with (dataset_dir / "annotations.json").open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    annotation_groups = payload if isinstance(payload, list) else [payload]
+    vote_counts_by_image: dict[str, Counter[str]] = defaultdict(Counter)
+    class_names: set[str] = set()
+
+    for group in annotation_groups:
+        for annotation in group.get("annotations", []):
+            image_path = annotation["image_path"]
+            class_name = annotation["class_label"]
+            vote_counts_by_image[image_path][class_name] += 1
+            class_names.add(class_name)
+
+    ordered_classes = sorted(class_names)
+    records: list[ImageRecord] = []
+
+    for image_path, class_counts in sorted(vote_counts_by_image.items()):
+        total_votes = sum(class_counts.values())
+        target_probs = np.array(
+            [class_counts.get(class_name, 0) / total_votes for class_name in ordered_classes],
+            dtype=np.float32,
+        )
+        fold = extract_fold_name(image_path)
+        records.append(ImageRecord(image_path=image_path, fold=fold, target_probs=target_probs))
+
+    return ordered_classes, records
+
+
+def run_dataset_experiment(
+    dataset_name: str,
+    config: ImageExperimentConfig,
+) -> DatasetResult:
+    """Train and evaluate one dataset.
+
+    Data splitting happens in two stages:
+    1. Use one predefined fold as the held-out test set.
+    2. Split the remaining folds into train and validation.
+    """
+
+    class_names, records = load_image_dataset(config.data_root / dataset_name)
+    output_dir = config.output_root / dataset_name / config.encoder_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fold_names = config.folds or sorted({record.fold for record in records})
+    fold_results: list[FoldResult] = []
+
+    for fold_offset, test_fold in enumerate(fold_names):
+        fold_seed = config.seed + fold_offset
+
+        train_records = [record for record in records if record.fold != test_fold]
+        test_records = [record for record in records if record.fold == test_fold]
+
+        train_records = truncate_records(train_records, config.max_train_samples)
+        test_records = truncate_records(test_records, config.max_test_samples)
+        train_records, val_records = split_train_validation_records(
+            train_records,
+            validation_size=config.validation_size,
+            seed=fold_seed,
+        )
+
+        member_probabilities: list[np.ndarray] = []
+        member_losses: list[float] = []
+        member_prediction_files: list[str] = []
+
+        for member_index in range(config.ensemble_size):
+            member_seed = fold_seed + 97 * member_index
+
+            model, history = train_single_model(
+                train_records=train_records,
+                val_records=val_records,
+                num_classes=len(class_names),
+                config=config,
+                seed=member_seed,
+            )
+
+            probabilities, targets, image_paths = predict_records(
+                model=model,
+                records=test_records,
+                config=config,
+            )
+
+            member_loss = mean_cross_entropy(targets, probabilities)
+            member_probabilities.append(probabilities)
+            member_losses.append(member_loss)
+
+            if config.save_member_predictions:
+                member_dir = output_dir / test_fold / f"member_{member_index:02d}"
+                member_dir.mkdir(parents=True, exist_ok=True)
+                member_prediction_path = member_dir / "predictions.csv"
+                export_prediction_frame(
+                    output_path=member_prediction_path,
+                    image_paths=image_paths,
+                    targets=targets,
+                    probabilities=probabilities,
+                    class_names=class_names,
+                    fold_name=test_fold,
+                    history=history,
+                )
+                member_prediction_files.append(str(member_prediction_path))
+
+        ensemble_probabilities = np.mean(np.stack(member_probabilities, axis=0), axis=0)
+        ensemble_loss = mean_cross_entropy(targets, ensemble_probabilities)
+
+        ensemble_prediction_path = output_dir / test_fold / "ensemble_predictions.csv"
+        export_prediction_frame(
+            output_path=ensemble_prediction_path,
+            image_paths=image_paths,
+            targets=targets,
+            probabilities=ensemble_probabilities,
+            class_names=class_names,
+            fold_name=test_fold,
+            history=None,
+        )
+
+        fold_results.append(
+            FoldResult(
+                test_fold=test_fold,
+                train_size=len(train_records),
+                val_size=len(val_records),
+                test_size=len(test_records),
+                member_cross_entropies=member_losses,
+                ensemble_cross_entropy=ensemble_loss,
+                prediction_file=str(ensemble_prediction_path),
+                member_prediction_files=member_prediction_files,
+            )
+        )
+
+    result = DatasetResult(
+        dataset_name=dataset_name,
+        encoder_name=config.encoder_name,
+        class_names=class_names,
+        folds=fold_results,
+        mean_member_cross_entropy=float(
+            np.mean([loss for fold in fold_results for loss in fold.member_cross_entropies])
+        ),
+        mean_ensemble_cross_entropy=float(
+            np.mean([fold.ensemble_cross_entropy for fold in fold_results])
+        ),
+        config=serialize_config(config),
+    )
+
+    with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(result.to_dict(), handle, indent=2)
+
+    return result
+
+
+def train_single_model(
+    train_records: list[ImageRecord],
+    val_records: list[ImageRecord],
+    num_classes: int,
+    config: ImageExperimentConfig,
+    seed: int,
+) -> tuple[nn.Module, dict[str, list[float]]]:
+    set_seed(seed)
+
+    train_loader = make_dataloader(
+        data_root=config.data_root,
+        records=train_records,
+        transform=build_transform(config, train=True),
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=config.device.startswith("cuda"),
+    )
+    val_loader = make_dataloader(
+        data_root=config.data_root,
+        records=val_records,
+        transform=build_transform(config, train=False),
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=config.device.startswith("cuda"),
+    )
+
+    model = TorchvisionSoftClassifier(
+        encoder_name=config.encoder_name,
+        num_classes=num_classes,
+        pretrained=config.pretrained,
+        freeze_encoder=config.freeze_encoder,
+    ).to(config.device)
+
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    criterion = SoftTargetCrossEntropy()
+
+    best_state = copy.deepcopy(model.state_dict())
+    best_val_loss = math.inf
+    epochs_without_improvement = 0
+    history = {"train_cross_entropy": [], "val_cross_entropy": []}
+
+    for _ in range(config.epochs):
+        train_loss = run_epoch(model, train_loader, criterion, config.device, optimizer)
+        val_loss = run_epoch(model, val_loader, criterion, config.device)
+
+        history["train_cross_entropy"].append(train_loss)
+        history["val_cross_entropy"].append(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(model.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= config.early_stopping_patience:
+                break
+
+    model.load_state_dict(best_state)
+    model.eval()
+    return model, history
+
+
+def predict_records(
+    model: nn.Module,
+    records: list[ImageRecord],
+    config: ImageExperimentConfig,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    loader = make_dataloader(
+        data_root=config.data_root,
+        records=records,
+        transform=build_transform(config, train=False),
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=config.device.startswith("cuda"),
+    )
+
+    all_probabilities: list[np.ndarray] = []
+    all_targets: list[np.ndarray] = []
+    all_paths: list[str] = []
+
+    model.eval()
+    with torch.no_grad():
+        for images, targets, image_paths in loader:
+            logits = model(images.to(config.device))
+            probabilities = torch.softmax(logits, dim=1).cpu().numpy()
+            all_probabilities.append(probabilities)
+            all_targets.append(targets.numpy())
+            all_paths.extend(image_paths)
+
+    return (
+        np.concatenate(all_probabilities, axis=0),
+        np.concatenate(all_targets, axis=0),
+        all_paths,
+    )
+
+
+def split_train_validation_records(
+    records: list[ImageRecord],
+    validation_size: float,
+    seed: int,
+) -> tuple[list[ImageRecord], list[ImageRecord]]:
+    """Split train folds into train and validation"""
+    stratify = np.array([int(np.argmax(record.target_probs)) for record in records])
+
+    train_indices, val_indices = train_test_split(
+        np.arange(len(records)),
+        test_size=validation_size,
+        random_state=seed,
+        stratify=stratify,
+    )
+    train_records = [records[index] for index in train_indices]
+    val_records = [records[index] for index in val_indices]
+    return train_records, val_records
+
+
+def build_transform(config: ImageExperimentConfig, train: bool) -> transforms.Compose:
+    input_size = config.input_size or DEFAULT_ENCODERS[config.encoder_name]
+    resize_size = int(input_size * 1.15)
+
+    steps: list[Any] = []
+    if train:
+        steps.extend(
+            [
+                transforms.Resize((resize_size, resize_size)),
+                transforms.RandomCrop((input_size, input_size)),
+                transforms.RandomHorizontalFlip(),
+            ]
+        )
+    else:
+        steps.append(transforms.Resize((input_size, input_size)))
+
+    steps.extend(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    )
+    return transforms.Compose(steps)
+
+
+def make_dataloader(
+    data_root: Path,
+    records: list[ImageRecord],
+    transform: transforms.Compose,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool,
+) -> DataLoader:
+    dataset = SoftLabelImageDataset(data_root, records, transform)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
+def export_prediction_frame(
+    output_path: Path,
+    image_paths: list[str],
+    targets: np.ndarray,
+    probabilities: np.ndarray,
+    class_names: list[str],
+    fold_name: str,
+    history: dict[str, list[float]] | None,
+) -> None:
+    frame = pd.DataFrame(
+        {
+            "image_path": image_paths,
+            "fold": fold_name,
+            "cross_entropy": cross_entropy_per_sample(targets, probabilities),
+            "target_entropy": entropy_per_sample(targets),
+        }
+    )
+
+    for class_index, class_name in enumerate(class_names):
+        frame[f"target::{class_name}"] = targets[:, class_index]
+        frame[f"pred::{class_name}"] = probabilities[:, class_index]
+
+    frame.to_csv(output_path, index=False)
+
+    if history is not None:
+        with output_path.with_name("history.json").open("w", encoding="utf-8") as handle:
+            json.dump(history, handle, indent=2)
+
+
+def mean_cross_entropy(targets: np.ndarray, probabilities: np.ndarray) -> float:
+    return float(cross_entropy_per_sample(targets, probabilities).mean())
+
+
+def cross_entropy_per_sample(targets: np.ndarray, probabilities: np.ndarray) -> np.ndarray:
+    clipped = np.clip(probabilities, 1e-8, 1.0)
+    return -(targets * np.log(clipped)).sum(axis=1)
+
+
+def entropy_per_sample(distributions: np.ndarray) -> np.ndarray:
+    clipped = np.clip(distributions, 1e-8, 1.0)
+    return -(clipped * np.log(clipped)).sum(axis=1)
+
+
+def save_results_summary(output_root: Path, results: list[DatasetResult]) -> None:
+    output_root.mkdir(parents=True, exist_ok=True)
+    payload = [result.to_dict() for result in results]
+    with (output_root / "results.json").open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: str,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> float:
+    is_training = optimizer is not None
+    model.train(mode=is_training)
+
+    total_loss = 0.0
+    total_items = 0
+
+    with torch.set_grad_enabled(is_training):
+        for images, targets, _ in loader:
+            images = images.to(device)
+            targets = targets.to(device)
+            logits = model(images)
+            loss = criterion(logits, targets)
+
+            if is_training:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+
+            batch_size = images.shape[0]
+            total_loss += float(loss.item()) * batch_size
+            total_items += batch_size
+
+    return total_loss / max(total_items, 1)
+
+
+def replace_classification_head_with_identity(model: nn.Module) -> int:
+    """Replaces the original classifier and return the feature size.
+    Different architectures store their final classifier in different attributes (`fc`, `classifier`, `heads`).
+    """
+
+    if hasattr(model, "fc") and isinstance(model.fc, nn.Linear):
+        in_features = int(model.fc.in_features)
+        model.fc = nn.Identity()
+        return in_features
+
+    if hasattr(model, "classifier"):
+        classifier = model.classifier
+        if isinstance(classifier, nn.Linear):
+            in_features = int(classifier.in_features)
+            model.classifier = nn.Identity()
+            return in_features
+        if isinstance(classifier, nn.Sequential):
+            linear_layers = [layer for layer in classifier if isinstance(layer, nn.Linear)]
+            if linear_layers:
+                in_features = int(linear_layers[-1].in_features)
+                model.classifier = nn.Identity()
+                return in_features
+
+    if hasattr(model, "heads"):
+        heads = model.heads
+        if isinstance(heads, nn.Linear):
+            in_features = int(heads.in_features)
+            model.heads = nn.Identity()
+            return in_features
+        if isinstance(heads, nn.Sequential):
+            linear_layers = [layer for layer in heads if isinstance(layer, nn.Linear)]
+            if linear_layers:
+                in_features = int(linear_layers[-1].in_features)
+                model.heads = nn.Identity()
+                return in_features
+
+    raise ValueError("Unsupported encoder architecture for head replacement.")
+
+
+def extract_fold_name(image_path: str) -> str:
+    parts = Path(image_path).parts
+    return parts[1] if len(parts) > 1 else "fold0"
+
+
+def truncate_records(records: list[ImageRecord], max_items: int | None) -> list[ImageRecord]:
+    if max_items is None or len(records) <= max_items:
+        return records
+    return records[:max_items]
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def serialize_config(config: ImageExperimentConfig) -> dict[str, Any]:
+    return {
+        "data_root": str(config.data_root),
+        "output_root": str(config.output_root),
+        "encoder_name": config.encoder_name,
+        "pretrained": config.pretrained,
+        "freeze_encoder": config.freeze_encoder,
+        "ensemble_size": config.ensemble_size,
+        "batch_size": config.batch_size,
+        "epochs": config.epochs,
+        "learning_rate": config.learning_rate,
+        "weight_decay": config.weight_decay,
+        "validation_size": config.validation_size,
+        "early_stopping_patience": config.early_stopping_patience,
+        "bootstrap_members": config.bootstrap_members,
+        "num_workers": config.num_workers,
+        "device": config.device,
+        "seed": config.seed,
+        "max_train_samples": config.max_train_samples,
+        "max_test_samples": config.max_test_samples,
+        "folds": config.folds,
+        "input_size": config.input_size,
+        "save_member_predictions": config.save_member_predictions,
+    }

@@ -1,5 +1,68 @@
 # UCI Ensemble Uncertainty Quantification
 
+## Image soft-label training
+
+Image datasets should be stored under [data/image](data/image). Compatible datasets can be downloaded here: https://zenodo.org/records/8115942
+
+### Pipeline
+
+- loads annotator votes from each dataset `annotations.json`
+- creates per-image target probability distributions from annotator votes
+- test data is a held-out fold (each dataset is already split into 5 separate folds), remaining folds are used for training
+- trains a classifier (basically any image classifier can be chosen that is supported via torchvision) with soft-target cross entropy
+- exports per-image predicted distributions for later uncertainty analysis
+
+### Supported encoders
+
+- `resnet18`
+- `resnet50`
+- `efficientnet_b0`
+- `convnext_tiny`
+- `vit_b_16`
+
+The implementation is in [image_pipeline.py](image_pipeline.py) and the CLI runner is [run_image_experiments.py](run_image_experiments.py).
+
+### Default training setup
+
+- pretrained ImageNet encoder
+- frozen encoder by default, with a learned classification head
+- soft-target cross entropy loss
+- fold-based evaluation using the existing `fold1` ... `fold5` directories
+
+### Example commands
+
+Run one dataset with a `resnet18` ensemble:
+
+    python run_image_experiments.py --dataset CIFAR10H --encoder resnet18 --ensemble-size 5
+
+Fine-tune the full encoder instead of only the head:
+
+    python run_image_experiments.py --dataset Benthic --encoder convnext_tiny --ensemble-size 3 --finetune
+
+Quick smoke test on a small subset:
+
+    python run_image_experiments.py --dataset CIFAR10H --encoder resnet18 --ensemble-size 1 --epochs 1 --max-train-samples 64 --max-test-samples 32 --workers 0
+
+### Outputs
+
+Results are written under [out/image](out/image):
+
+- one folder per dataset and encoder
+- one subfolder per held-out fold
+- `predictions.csv` for each ensemble member
+- `ensemble_predictions.csv` for the averaged ensemble probabilities
+- `summary.json` with fold metrics and mean cross entropy
+- top-level `results.json` summarizing all runs launched by the CLI
+
+Each exported prediction file contains:
+
+- image path
+- held-out fold
+- target distribution for every class
+- predicted distribution for every class
+- per-sample cross entropy
+- target entropy
+
 ## Dataset Overview
 
 | Dataset | Samples | Features | Classes | Label Col | UCI Link | LR Acc | TabPFN Acc | LR Cov | TabPFN Cov |
@@ -28,40 +91,3 @@ arguments = {
     "sampling_mode": "shared",
 }
 ```
-
-## Notes on Convex Hull Coverage with Shared Sampling
-
-The `shared` sampling mode trains all ensemble members on the **same** set of sampled labels, with
-diversity coming only from different random MLP weight initialisations. This limits the spread of
-the ensemble's predicted probability distributions, which in turn limits how large the convex hull
-can be in the probability simplex.
-
-Key observations from the dataset search:
-
-- **3 classes** – Coverage is generally healthy (0.14–1.00) because the 2-dimensional simplex is
-  easy to cover even with modest ensemble diversity.
-- **6 classes** – Coverage starts dropping; Satellite (0.275) and Glass (0.169) still work for LR
-  thanks to moderate base-model difficulty and reasonable feature counts.
-- **10 classes** – MFeat-Factors stands out at 0.885 LR coverage. Its 216 features give the MLP
-  enough degrees of freedom to find meaningfully different solutions from different random
-  initialisations, even with identical training labels.
-- **>10 classes** – No dataset tested achieved non-zero convex hull coverage under shared sampling.
-  The probability simplex becomes too high-dimensional for the tight ensemble to cover.
-
-### TabPFN vs Logistic Regression Coverage
-
-TabPFN consistently achieves higher accuracy than logistic regression, but this **hurts** convex
-hull coverage under shared sampling. Because TabPFN produces more confident (peaked) probability
-distributions, the target vector is harder for the MLP ensemble's convex hull to contain. This
-effect is especially pronounced for 6+ classes, where TabPFN coverage drops to 0.000 on every
-dataset despite strong accuracy. For 3-class datasets the coverage remains non-zero but is
-generally lower than the LR counterpart (e.g. CMC: 0.396 LR vs 0.235 TabPFN).
-
-### Factors that promote non-zero coverage
-
-1. **Balanced classes** – rare classes with very few samples create probability dimensions the
-   ensemble consistently mis-covers.
-2. **Many features relative to classes** – more features → more room for the MLP to find diverse
-   solutions from different random initialisations.
-3. **Moderate base-model accuracy** – overly confident models produce very peaked target
-   distributions that are hard for the ensemble to bracket.

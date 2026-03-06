@@ -1292,6 +1292,8 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "tabpfn" },
     { name = "tabpfn-extensions" },
+    { name = "torch" },
+    { name = "torchvision" },
 ]
 
 [package.metadata]
@@ -1304,4 +1306,6 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.6,<1.7" },
     { name = "tabpfn", specifier = ">=2.0.3" },
     { name = "tabpfn-extensions", extras = ["many-classes"], specifier = ">=0.0.4" },
+    { name = "torch", specifier = ">=2.10.0" },
+    { name = "torchvision", specifier = ">=0.25.0" },
 ]
