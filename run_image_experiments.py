@@ -6,6 +6,7 @@ from pathlib import Path
 from image_pipeline import (
     ImageExperimentConfig,
     discover_image_datasets,
+    list_available_encoders,
     run_dataset_experiment,
     save_results_summary,
 )
@@ -24,13 +25,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--encoder",
         default="resnet18",
+        choices=list_available_encoders(),
         help="Backbone encoder used for the classifier head.",
     )
     parser.add_argument(
         "--ensemble-size",
         type=int,
         default=5,
-        help="Number of ensemble members per test fold.",
+        help="Number of independently trained models per held-out test fold.",
     )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -56,18 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable ImageNet initialization for the encoder.",
     )
     parser.add_argument(
-        "--no-bootstrap",
-        action="store_true",
-        help="Disable bootstrap sampling across ensemble members.",
-    )
-    parser.add_argument(
         "--fold",
         action="append",
         dest="folds",
-        help="Restrict evaluation to specific held-out fold names, for example fold1.",
+        help="Held-out test fold to evaluate, for example fold1. Repeat to run multiple folds.",
     )
-    parser.add_argument("--max-train-samples", type=int, default=None)
-    parser.add_argument("--max-test-samples", type=int, default=None)
     parser.add_argument(
         "--output-root",
         type=Path,
@@ -103,12 +98,9 @@ def main():
         weight_decay=args.weight_decay,
         validation_size=args.validation_size,
         early_stopping_patience=args.patience,
-        bootstrap_members=not args.no_bootstrap,
         num_workers=args.workers,
         device=device,
         seed=args.seed,
-        max_train_samples=args.max_train_samples,
-        max_test_samples=args.max_test_samples,
         folds=args.folds,
     )
 

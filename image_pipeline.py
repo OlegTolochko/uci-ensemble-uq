@@ -7,7 +7,17 @@ Pipeline:
 4. Use the dataset's predefined folds as the train/test split.
 5. Split only the training folds again into train/validation.
 6. Train a classifier with soft-target cross entropy.
-7. Average member probabilities if an ensemble is requested.
+7. Save predictions and model weights.
+
+`ensemble_size` means: how many independently initialized models to train
+for the same held-out test fold. It does not control how many folds are used.
+
+Examples:
+- `folds=None`, `ensemble_size=1` on a 5-fold dataset -> train 5 models total
+    (one per held-out test fold).
+- `folds=["fold1"]`, `ensemble_size=1` -> train exactly 1 model.
+- `folds=["fold1"]`, `ensemble_size=5` -> train 5 models on the same split and
+    average their probabilities.
 """
 
 from __future__ import annotations
@@ -67,15 +77,10 @@ class ImageExperimentConfig:
     weight_decay: float = 1e-4
     validation_size: float = 0.1
     early_stopping_patience: int = 4
-    bootstrap_members: bool = True
     num_workers: int = 4
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     seed: int = 42
-    max_train_samples: int | None = None
-    max_test_samples: int | None = None
     folds: list[str] | None = None
-    input_size: int | None = None
-    save_member_predictions: bool = True
 
 
 @dataclass(slots=True)
@@ -88,6 +93,7 @@ class FoldResult:
     ensemble_cross_entropy: float
     prediction_file: str
     member_prediction_files: list[str]
+    model_files: list[str]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,6 +105,7 @@ class FoldResult:
             "ensemble_cross_entropy": self.ensemble_cross_entropy,
             "prediction_file": self.prediction_file,
             "member_prediction_files": self.member_prediction_files,
+            "model_files": self.model_files,
         }
 
 
@@ -169,7 +176,7 @@ class TorchvisionSoftClassifier(nn.Module):
             weights = get_model_weights(encoder_name).DEFAULT
 
         self.encoder = get_model(encoder_name, weights=weights)
-        in_features = replace_classification_head_with_identity(self.encoder)
+        in_features = replace_classification_head_with_identity(self.encoder, encoder_name)
         self.head = nn.Linear(in_features, num_classes)
 
         if freeze_encoder:
@@ -181,6 +188,10 @@ class TorchvisionSoftClassifier(nn.Module):
         if features.ndim > 2:
             features = torch.flatten(features, start_dim=1)
         return self.head(features)
+
+
+def list_available_encoders() -> list[str]:
+    return sorted(DEFAULT_ENCODERS)
 
 
 def discover_image_datasets(data_root: Path) -> list[str]:
@@ -247,8 +258,6 @@ def run_dataset_experiment(
         train_records = [record for record in records if record.fold != test_fold]
         test_records = [record for record in records if record.fold == test_fold]
 
-        train_records = truncate_records(train_records, config.max_train_samples)
-        test_records = truncate_records(test_records, config.max_test_samples)
         train_records, val_records = split_train_validation_records(
             train_records,
             validation_size=config.validation_size,
@@ -258,9 +267,12 @@ def run_dataset_experiment(
         member_probabilities: list[np.ndarray] = []
         member_losses: list[float] = []
         member_prediction_files: list[str] = []
+        model_files: list[str] = []
 
         for member_index in range(config.ensemble_size):
             member_seed = fold_seed + 97 * member_index
+            member_dir = output_dir / test_fold / f"member_{member_index:02d}"
+            member_dir.mkdir(parents=True, exist_ok=True)
 
             model, history = train_single_model(
                 train_records=train_records,
@@ -280,20 +292,21 @@ def run_dataset_experiment(
             member_probabilities.append(probabilities)
             member_losses.append(member_loss)
 
-            if config.save_member_predictions:
-                member_dir = output_dir / test_fold / f"member_{member_index:02d}"
-                member_dir.mkdir(parents=True, exist_ok=True)
-                member_prediction_path = member_dir / "predictions.csv"
-                export_prediction_frame(
-                    output_path=member_prediction_path,
-                    image_paths=image_paths,
-                    targets=targets,
-                    probabilities=probabilities,
-                    class_names=class_names,
-                    fold_name=test_fold,
-                    history=history,
-                )
-                member_prediction_files.append(str(member_prediction_path))
+            model_path = member_dir / "model.pt"
+            torch.save(model.state_dict(), model_path)
+            model_files.append(str(model_path))
+
+            member_prediction_path = member_dir / "predictions.csv"
+            export_prediction_frame(
+                output_path=member_prediction_path,
+                image_paths=image_paths,
+                targets=targets,
+                probabilities=probabilities,
+                class_names=class_names,
+                fold_name=test_fold,
+                history=history,
+            )
+            member_prediction_files.append(str(member_prediction_path))
 
         ensemble_probabilities = np.mean(np.stack(member_probabilities, axis=0), axis=0)
         ensemble_loss = mean_cross_entropy(targets, ensemble_probabilities)
@@ -319,6 +332,7 @@ def run_dataset_experiment(
                 ensemble_cross_entropy=ensemble_loss,
                 prediction_file=str(ensemble_prediction_path),
                 member_prediction_files=member_prediction_files,
+                model_files=model_files,
             )
         )
 
@@ -450,7 +464,8 @@ def split_train_validation_records(
     validation_size: float,
     seed: int,
 ) -> tuple[list[ImageRecord], list[ImageRecord]]:
-    """Split train folds into train and validation"""
+    """Split the non-test data into train and validation."""
+
     stratify = np.array([int(np.argmax(record.target_probs)) for record in records])
 
     train_indices, val_indices = train_test_split(
@@ -465,20 +480,13 @@ def split_train_validation_records(
 
 
 def build_transform(config: ImageExperimentConfig, train: bool) -> transforms.Compose:
-    input_size = config.input_size or DEFAULT_ENCODERS[config.encoder_name]
-    resize_size = int(input_size * 1.15)
+    input_size = DEFAULT_ENCODERS[config.encoder_name]
 
     steps: list[Any] = []
     if train:
-        steps.extend(
-            [
-                transforms.Resize((resize_size, resize_size)),
-                transforms.RandomCrop((input_size, input_size)),
-                transforms.RandomHorizontalFlip(),
-            ]
-        )
-    else:
-        steps.append(transforms.Resize((input_size, input_size)))
+        steps.append(transforms.RandomHorizontalFlip())
+
+    steps.append(transforms.Resize((input_size, input_size)))
 
     steps.extend(
         [
@@ -590,54 +598,31 @@ def run_epoch(
     return total_loss / max(total_items, 1)
 
 
-def replace_classification_head_with_identity(model: nn.Module) -> int:
-    """Replaces the original classifier and return the feature size.
-    Different architectures store their final classifier in different attributes (`fc`, `classifier`, `heads`).
-    """
+def replace_classification_head_with_identity(model: nn.Module, encoder_name: str) -> int:
+    """Remove the ImageNet classifier so we can attach our own output layer. (more may be added)"""
 
-    if hasattr(model, "fc") and isinstance(model.fc, nn.Linear):
+    if encoder_name in {"resnet18", "resnet50"}:
         in_features = int(model.fc.in_features)
         model.fc = nn.Identity()
         return in_features
 
-    if hasattr(model, "classifier"):
-        classifier = model.classifier
-        if isinstance(classifier, nn.Linear):
-            in_features = int(classifier.in_features)
-            model.classifier = nn.Identity()
-            return in_features
-        if isinstance(classifier, nn.Sequential):
-            linear_layers = [layer for layer in classifier if isinstance(layer, nn.Linear)]
-            if linear_layers:
-                in_features = int(linear_layers[-1].in_features)
-                model.classifier = nn.Identity()
-                return in_features
+    if encoder_name in {"efficientnet_b0", "convnext_tiny"}:
+        in_features = int(model.classifier[-1].in_features)
+        model.classifier = nn.Identity()
+        return in_features
 
-    if hasattr(model, "heads"):
-        heads = model.heads
-        if isinstance(heads, nn.Linear):
-            in_features = int(heads.in_features)
-            model.heads = nn.Identity()
-            return in_features
-        if isinstance(heads, nn.Sequential):
-            linear_layers = [layer for layer in heads if isinstance(layer, nn.Linear)]
-            if linear_layers:
-                in_features = int(linear_layers[-1].in_features)
-                model.heads = nn.Identity()
-                return in_features
+    if encoder_name == "vit_b_16":
+        in_features = int(model.heads.head.in_features)
+        model.heads = nn.Identity()
+        return in_features
 
-    raise ValueError("Unsupported encoder architecture for head replacement.")
+    raise ValueError(f"Unsupported encoder: {encoder_name}")
 
 
 def extract_fold_name(image_path: str) -> str:
     parts = Path(image_path).parts
     return parts[1] if len(parts) > 1 else "fold0"
 
-
-def truncate_records(records: list[ImageRecord], max_items: int | None) -> list[ImageRecord]:
-    if max_items is None or len(records) <= max_items:
-        return records
-    return records[:max_items]
 
 
 def set_seed(seed: int) -> None:
@@ -662,13 +647,8 @@ def serialize_config(config: ImageExperimentConfig) -> dict[str, Any]:
         "weight_decay": config.weight_decay,
         "validation_size": config.validation_size,
         "early_stopping_patience": config.early_stopping_patience,
-        "bootstrap_members": config.bootstrap_members,
         "num_workers": config.num_workers,
         "device": config.device,
         "seed": config.seed,
-        "max_train_samples": config.max_train_samples,
-        "max_test_samples": config.max_test_samples,
         "folds": config.folds,
-        "input_size": config.input_size,
-        "save_member_predictions": config.save_member_predictions,
     }
