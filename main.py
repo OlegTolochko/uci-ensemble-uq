@@ -51,22 +51,29 @@ def entropy_histogram(
     plt.close()
 
 
-def load_data(data_path="data/iris/iris.data", label_column=-1, sep=None, header=None, 
-              usecols=None, id_column=None, encode_first_column=False):
+def load_data(
+    data_path="data/iris/iris.data",
+    label_column=-1,
+    sep=None,
+    header=None,
+    usecols=None,
+    id_column=None,
+    encode_first_column=False,
+):
     df = pd.read_csv(data_path, sep=sep, header=header)
-    
+
     if id_column is not None:
         df = df.drop(columns=df.columns[id_column])
-    
+
     if encode_first_column:
         first_col = df.columns[0]
-        if df[first_col].dtype == object or str(df[first_col].dtype) == 'str':
+        if df[first_col].dtype == object or str(df[first_col].dtype) == "str":
             le = LabelEncoder()
             df[first_col] = le.fit_transform(df[first_col])
-    
+
     if usecols is not None:
         df = df[usecols]
-    
+
     y = df.iloc[:, label_column].values
     X = df.drop(columns=df.columns[label_column]).values.astype(float)
     return X, y
@@ -116,7 +123,7 @@ def pipeline(
     encode_first_column=False,
 ):
     X, y = load_data(
-        data_path=data_path, 
+        data_path=data_path,
         label_column=label_column,
         sep=sep,
         header=header,
@@ -128,7 +135,11 @@ def pipeline(
 
     use_stratify = can_stratify(y, test_size)
     X_train_full, X_test, y_train_full, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y if use_stratify else None
+        X,
+        y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y if use_stratify else None,
     )
 
     if calibration_size > 0:
@@ -183,7 +194,9 @@ def pipeline(
     classes = np.unique(y)
     n_classes = len(classes)
 
-    convex_hull_cov = check_convex_hull_coverage(ensemble, X_test, probs_test, n_classes=n_classes)
+    convex_hull_cov = check_convex_hull_coverage(
+        ensemble, X_test, probs_test, n_classes=n_classes
+    )
     return accuracy, convex_hull_cov
 
 

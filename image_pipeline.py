@@ -59,8 +59,8 @@ DEFAULT_ENCODERS = {
 @dataclass(slots=True)
 class ImageRecord:
     image_path: str
-    fold: str # e.g. `fold0`, `fold1`, etc.
-    target_probs: np.ndarray # e.g. [0.1, 0.8, 0.1]
+    fold: str  # e.g. `fold0`, `fold1`, etc.
+    target_probs: np.ndarray  # e.g. [0.1, 0.8, 0.1]
 
 
 @dataclass(slots=True)
@@ -78,7 +78,13 @@ class ImageExperimentConfig:
     validation_size: float = 0.1
     early_stopping_patience: int = 4
     num_workers: int = 4
-    device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    device: str = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
+        else "cpu"
+    )
     seed: int = 42
     folds: list[str] | None = None
 
@@ -139,7 +145,7 @@ class SoftLabelImageDataset(Dataset):
         data_root: Path,
         records: list[ImageRecord],
         transform: transforms.Compose,
-    ) -> None:
+    ):
         self.data_root = data_root
         self.records = records
         self.transform = transform
@@ -162,13 +168,14 @@ class SoftTargetCrossEntropy(nn.Module):
 
 class TorchvisionSoftClassifier(nn.Module):
     """Torchvision encoder with a new linear head."""
+
     def __init__(
         self,
         encoder_name: str,
         num_classes: int,
         pretrained: bool,
         freeze_encoder: bool,
-    ) -> None:
+    ):
         super().__init__()
 
         weights = None
@@ -176,7 +183,9 @@ class TorchvisionSoftClassifier(nn.Module):
             weights = get_model_weights(encoder_name).DEFAULT
 
         self.encoder = get_model(encoder_name, weights=weights)
-        in_features = replace_classification_head_with_identity(self.encoder, encoder_name)
+        in_features = replace_classification_head_with_identity(
+            self.encoder, encoder_name
+        )
         self.head = nn.Linear(in_features, num_classes)
 
         if freeze_encoder:
@@ -225,11 +234,16 @@ def load_image_dataset(dataset_dir: Path) -> tuple[list[str], list[ImageRecord]]
     for image_path, class_counts in sorted(vote_counts_by_image.items()):
         total_votes = sum(class_counts.values())
         target_probs = np.array(
-            [class_counts.get(class_name, 0) / total_votes for class_name in ordered_classes],
+            [
+                class_counts.get(class_name, 0) / total_votes
+                for class_name in ordered_classes
+            ],
             dtype=np.float32,
         )
         fold = extract_fold_name(image_path)
-        records.append(ImageRecord(image_path=image_path, fold=fold, target_probs=target_probs))
+        records.append(
+            ImageRecord(image_path=image_path, fold=fold, target_probs=target_probs)
+        )
 
     return ordered_classes, records
 
@@ -342,7 +356,9 @@ def run_dataset_experiment(
         class_names=class_names,
         folds=fold_results,
         mean_member_cross_entropy=float(
-            np.mean([loss for fold in fold_results for loss in fold.member_cross_entropies])
+            np.mean(
+                [loss for fold in fold_results for loss in fold.member_cross_entropies]
+            )
         ),
         mean_ensemble_cross_entropy=float(
             np.mean([fold.ensemble_cross_entropy for fold in fold_results])
@@ -524,7 +540,7 @@ def export_prediction_frame(
     class_names: list[str],
     fold_name: str,
     history: dict[str, list[float]] | None,
-) -> None:
+):
     frame = pd.DataFrame(
         {
             "image_path": image_paths,
@@ -541,7 +557,9 @@ def export_prediction_frame(
     frame.to_csv(output_path, index=False)
 
     if history is not None:
-        with output_path.with_name("history.json").open("w", encoding="utf-8") as handle:
+        with output_path.with_name("history.json").open(
+            "w", encoding="utf-8"
+        ) as handle:
             json.dump(history, handle, indent=2)
 
 
@@ -549,7 +567,9 @@ def mean_cross_entropy(targets: np.ndarray, probabilities: np.ndarray) -> float:
     return float(cross_entropy_per_sample(targets, probabilities).mean())
 
 
-def cross_entropy_per_sample(targets: np.ndarray, probabilities: np.ndarray) -> np.ndarray:
+def cross_entropy_per_sample(
+    targets: np.ndarray, probabilities: np.ndarray
+) -> np.ndarray:
     clipped = np.clip(probabilities, 1e-8, 1.0)
     return -(targets * np.log(clipped)).sum(axis=1)
 
@@ -559,7 +579,7 @@ def entropy_per_sample(distributions: np.ndarray) -> np.ndarray:
     return -(clipped * np.log(clipped)).sum(axis=1)
 
 
-def save_results_summary(output_root: Path, results: list[DatasetResult]) -> None:
+def save_results_summary(output_root: Path, results: list[DatasetResult]):
     output_root.mkdir(parents=True, exist_ok=True)
     payload = [result.to_dict() for result in results]
     with (output_root / "results.json").open("w", encoding="utf-8") as handle:
@@ -598,7 +618,9 @@ def run_epoch(
     return total_loss / max(total_items, 1)
 
 
-def replace_classification_head_with_identity(model: nn.Module, encoder_name: str) -> int:
+def replace_classification_head_with_identity(
+    model: nn.Module, encoder_name: str
+) -> int:
     """Remove the ImageNet classifier so we can attach our own output layer. (more may be added)"""
 
     if encoder_name in {"resnet18", "resnet50"}:
@@ -624,8 +646,7 @@ def extract_fold_name(image_path: str) -> str:
     return parts[1] if len(parts) > 1 else "fold0"
 
 
-
-def set_seed(seed: int) -> None:
+def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

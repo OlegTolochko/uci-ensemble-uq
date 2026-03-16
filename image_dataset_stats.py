@@ -4,6 +4,7 @@ import math
 from collections import Counter
 from pathlib import Path
 
+
 def dataset_stats(dataset_dir: Path):
     with (dataset_dir / "annotations.json").open("r", encoding="utf-8") as f:
         records = json.load(f)
@@ -27,8 +28,8 @@ def dataset_stats(dataset_dir: Path):
         total_count = sum([count for _, count in enumerate(counts.values())])
         entropy = 0
         for class_id, count in enumerate(counts.values()):
-            class_prob = count/total_count
-            entropy += -class_prob*math.log(class_prob)
+            class_prob = count / total_count
+            entropy += -class_prob * math.log(class_prob)
         entropies.append(entropy)
 
     dataset_size = len(labels_by_image)
@@ -37,7 +38,7 @@ def dataset_stats(dataset_dir: Path):
     return dataset_size, num_classes, avg_entropy
 
 
-def main(im_path = "data/image"):
+def main(im_path="data/image"):
     dataset_dirs = sorted([p for p in Path(im_path).iterdir() if p.is_dir()])
 
     for dataset_dir in dataset_dirs:

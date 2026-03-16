@@ -82,9 +82,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    dataset_names = args.datasets or discover_image_datasets(args.data_root)
-    device = args.device or ("cuda" if __import__("torch").cuda.is_available() else "cpu")
-
+    dataset_names = args.datasets or discover_image_datasets(args.data_root) 
     config = ImageExperimentConfig(
         data_root=args.data_root,
         output_root=args.output_root,
@@ -99,7 +97,7 @@ def main():
         validation_size=args.validation_size,
         early_stopping_patience=args.patience,
         num_workers=args.workers,
-        device=device,
+        device=args.device,
         seed=args.seed,
         folds=args.folds,
     )
@@ -109,8 +107,7 @@ def main():
         print(f"\nRunning {config.encoder_name} on {dataset_name}")
         result = run_dataset_experiment(dataset_name=dataset_name, config=config)
         print(
-            "  mean ensemble cross entropy: "
-            f"{result.mean_ensemble_cross_entropy:.4f}"
+            f"  mean ensemble cross entropy: {result.mean_ensemble_cross_entropy:.4f}"
         )
         results.append(result)
 
