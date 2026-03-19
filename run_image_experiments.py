@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
+
 from image_pipeline import (
     ImageExperimentConfig,
     discover_image_datasets,
@@ -44,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument(
         "--device",
-        default=None,
+        default="cuda" if torch.cuda.is_available() else "cpu",
         help="Explicit device, for example cpu, cuda, or cuda:0.",
     )
     parser.add_argument(

@@ -194,7 +194,7 @@ class TorchvisionSoftClassifier(nn.Module):
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         features = self.encoder(images)
-        if features.ndim > 2:
+        if features.ndim > 2: # if the encoder doesn't already pool to (batch_size, features)
             features = torch.flatten(features, start_dim=1)
         return self.head(features)
 

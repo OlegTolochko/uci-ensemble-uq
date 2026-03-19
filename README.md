@@ -1,16 +1,53 @@
-# UCI Ensemble Uncertainty Quantification
+# Ensemble Uncertainty Quantification
 
-## Image soft-label training
+## Image dataset overview
 
-Image datasets should be stored under [data/image](data/image). Compatible datasets can be downloaded here: https://zenodo.org/records/8115942
+| Dataset       | size  | classes | avg. entropy | type                                                                        | input size | Mean Cross entropy |
+| ------------- | ----- | ------- | ------------ | --------------------------------------------------------------------------- | ---------- | --------------------------- |
+| benthic       | 4867  | 8       | 0.340        | image (images from the seafloor and consists of underwater flora and fauna) | 112x112    | 1.2707                      |
+| cifar-10h     | 10000 | 10      | 0.154        | image                                                                       | 32x32      | 0.7193                      |
+| MiceBone      | 7240  | 4       | 0.319        | image (Second-<br>Harmonic-Generation images of collagen fibers)            | 224x224    | 0.6009                      |
+| pig           | 10237 | 4       | 0.735        | image (tail images form european farms)                                     | 96x96      | 1.2544                      |
+| plankton      | 12280 | 10      | 0.163        | image (underwater plankton images)                                          | 96x96      | 0.6446                      |
+| qualityMRI    | 310   | 2       | 0.556        | image (MRI images)                                                          | 224x224    | 0.6441                      |
+| synthetic     | 15000 | 6       | 0.584        | image (images that contain 1 colored circle on a black background)          | 224x224    | 0.7084                      |
+| TreeVersity#1 | 9489  | 6       | 0.266        | image (plant images, single label per image)                                | 224x224    | 0.7351                      |
+| TreeVersity#6 | 9826  | 6       | 0.742        | image (plant images, possibly multiple labels per image)                    | 224x224    | 1.1153                      |
+| turkey        | 8040  | 3       | 0.196        | image (images of turkeys and their injuries)                                | 192x192    | 0.5712                      |
 
-### Pipeline
+(Config for Mean Cross Entropy: resnet18, 5 Fold CV mean, frozen encoder weights, 10 epochs)
+
+Image datasets should be stored under [data/image](data/image). Used datasets can be downloaded here: https://zenodo.org/records/8115942
+
+### Pipeline Overview
 
 - loads annotator votes from each dataset `annotations.json`
 - creates per-image target probability distributions from annotator votes
 - test data is a held-out fold (each dataset is already split into 5 separate folds), remaining folds are used for training
 - trains a classifier (basically any image classifier can be chosen that is supported via torchvision) with soft-target cross entropy
 - exports per-image predicted distributions for later uncertainty analysis
+
+
+### Detailed Pipeline Overview
+<details>
+<summary>Expand for Detailed Pipeline</summary>
+- Initialize Config for running experimenets (run_image_experiments.py)
+- For each dataset given (default is all datasets) run experiment pipeline (run_dataset_experiment), default trains 5 models, one per test fold, --fold fold1 would only use the first fold for testing
+- load class_names + dataset records (load_image_dataset)
+	- Each dataset has an annotations.json, which links an image path to its vote counts, structure: {"record_n": {"annotations": {"image_path": ..., "class_label": ..., "created_at": ...}, ...}, ...}
+	- For each annotation get image path + class label, count number of times a class was voted for a given image path
+	- transform counts to probabilities, wrap each Image into a ImageRecord (stores image path, fold it was in and target distribution)
+- For each given fold put all records that much this specific fold in the test set, all others in the train set
+- Split train set into train and validation sets
+- For the set number of ensemble members, train a model (each with different seed)
+	1. create train and validation dataloader, with set batch_size and transformations (currently normalization with imagenet mean + std, since pretrained models were trained on imagenet, as well as resize to expected input image size). Additionally also RandomHorizontalFlip currently for the train set
+	2. Initialize Model, based on passed model name (e.g. resnet18, resnet50, vit_b_16, etc.), replace classification head with linear layer and optionally freeze all layers leading up to classification head (--finetune in config if weights should not be frozen)
+	3. Set up optimizer (adamW) + loss (soft target cross entropy)
+	4. Begin training loop for set amount of epochs, (run_epoch for both training set, where gradients are calculated and weights are updated; once for validation set, where no weights are updated)
+	5. If validation loss is higher than the best validation loss recorded yet for a set amount of epochs, stop training early and load best model state and save model
+- Test model performance (calculate mean cross entropy) on held out test old and save individual prediction results to a csv table
+- Save result summary for each dataset (summary.json) across all fold results
+</details>
 
 ### Supported encoders
 
@@ -63,7 +100,7 @@ Each exported prediction file contains:
 - per-sample cross entropy
 - target entropy
 
-## Dataset Overview
+## UCI Dataset Overview
 
 | Dataset | Samples | Features | Classes | Label Col | UCI Link | LR Acc | TabPFN Acc | LR Cov | TabPFN Cov |
 |---|---:|---:|---:|---:|---|---:|---:|---:|---:|
