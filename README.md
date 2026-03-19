@@ -31,6 +31,7 @@ Image datasets should be stored under [data/image](data/image). Used datasets ca
 ### Detailed Pipeline Overview
 <details>
 <summary>Expand for Detailed Pipeline</summary>
+
 - Initialize Config for running experimenets (run_image_experiments.py)
 - For each dataset given (default is all datasets) run experiment pipeline (run_dataset_experiment), default trains 5 models, one per test fold, --fold fold1 would only use the first fold for testing
 - load class_names + dataset records (load_image_dataset)
