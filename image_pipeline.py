@@ -23,6 +23,7 @@ Examples:
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import random
@@ -114,6 +115,20 @@ class FoldResult:
             "model_files": self.model_files,
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "FoldResult":
+        return cls(
+            test_fold=payload["test_fold"],
+            train_size=payload["train_size"],
+            val_size=payload["val_size"],
+            test_size=payload["test_size"],
+            member_cross_entropies=list(payload["member_cross_entropies"]),
+            ensemble_cross_entropy=payload["ensemble_cross_entropy"],
+            prediction_file=payload["prediction_file"],
+            member_prediction_files=list(payload["member_prediction_files"]),
+            model_files=list(payload["model_files"]),
+        )
+
 
 @dataclass(slots=True)
 class DatasetResult:
@@ -135,6 +150,18 @@ class DatasetResult:
             "config": self.config,
             "folds": [fold.to_dict() for fold in self.folds],
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "DatasetResult":
+        return cls(
+            dataset_name=payload["dataset_name"],
+            encoder_name=payload["encoder_name"],
+            class_names=list(payload["class_names"]),
+            folds=[FoldResult.from_dict(fold) for fold in payload["folds"]],
+            mean_member_cross_entropy=payload["mean_member_cross_entropy"],
+            mean_ensemble_cross_entropy=payload["mean_ensemble_cross_entropy"],
+            config=dict(payload["config"]),
+        )
 
 
 class SoftLabelImageDataset(Dataset):
@@ -259,14 +286,28 @@ def run_dataset_experiment(
     2. Split the remaining folds into train and validation.
     """
 
-    class_names, records = load_image_dataset(config.data_root / dataset_name)
     output_dir = config.output_root / dataset_name / config.encoder_name
     output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = output_dir / "summary.json"
+    write_json(output_dir / "config.json", serialize_config(config))
+
+    if summary_path.exists():
+        return load_dataset_result(summary_path)
+
+    class_names, records = load_image_dataset(config.data_root / dataset_name)
 
     fold_names = config.folds or sorted({record.fold for record in records})
     fold_results: list[FoldResult] = []
 
     for fold_offset, test_fold in enumerate(fold_names):
+        fold_dir = output_dir / test_fold
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        fold_summary_path = fold_dir / "summary.json"
+
+        if fold_summary_path.exists():
+            fold_results.append(load_fold_result(fold_summary_path))
+            continue
+
         fold_seed = config.seed + fold_offset
 
         train_records = [record for record in records if record.fold != test_fold]
@@ -285,47 +326,64 @@ def run_dataset_experiment(
 
         for member_index in range(config.ensemble_size):
             member_seed = fold_seed + 97 * member_index
-            member_dir = output_dir / test_fold / f"member_{member_index:02d}"
+            member_dir = fold_dir / f"member_{member_index:02d}"
             member_dir.mkdir(parents=True, exist_ok=True)
+            member_summary = load_member_summary_if_complete(member_dir)
 
-            model, history = train_single_model(
-                train_records=train_records,
-                val_records=val_records,
-                num_classes=len(class_names),
-                config=config,
-                seed=member_seed,
-            )
+            if member_summary is None:
+                model, history = train_single_model(
+                    train_records=train_records,
+                    val_records=val_records,
+                    num_classes=len(class_names),
+                    config=config,
+                    seed=member_seed,
+                    checkpoint_dir=member_dir,
+                )
 
-            probabilities, targets, image_paths = predict_records(
-                model=model,
-                records=test_records,
-                config=config,
-            )
+                probabilities, targets, image_paths = predict_records(
+                    model=model,
+                    records=test_records,
+                    config=config,
+                )
 
-            member_loss = mean_cross_entropy(targets, probabilities)
+                member_loss = mean_cross_entropy(targets, probabilities)
+                model_path = member_dir / "model.pt"
+                torch.save(model.state_dict(), model_path)
+
+                member_prediction_path = member_dir / "predictions.csv"
+                export_prediction_frame(
+                    output_path=member_prediction_path,
+                    image_paths=image_paths,
+                    targets=targets,
+                    probabilities=probabilities,
+                    class_names=class_names,
+                    fold_name=test_fold,
+                    history=history,
+                )
+                member_summary = {
+                    "member_index": member_index,
+                    "member_seed": member_seed,
+                    "cross_entropy": member_loss,
+                    "model_file": str(model_path),
+                    "prediction_file": str(member_prediction_path),
+                    "history_file": str(member_prediction_path.with_name("history.json")),
+                }
+                write_json(member_dir / "summary.json", member_summary)
+            else:
+                probabilities, targets, image_paths = load_prediction_frame(
+                    Path(member_summary["prediction_file"]),
+                    class_names=class_names,
+                )
+
             member_probabilities.append(probabilities)
-            member_losses.append(member_loss)
-
-            model_path = member_dir / "model.pt"
-            torch.save(model.state_dict(), model_path)
-            model_files.append(str(model_path))
-
-            member_prediction_path = member_dir / "predictions.csv"
-            export_prediction_frame(
-                output_path=member_prediction_path,
-                image_paths=image_paths,
-                targets=targets,
-                probabilities=probabilities,
-                class_names=class_names,
-                fold_name=test_fold,
-                history=history,
-            )
-            member_prediction_files.append(str(member_prediction_path))
+            member_losses.append(float(member_summary["cross_entropy"]))
+            member_prediction_files.append(member_summary["prediction_file"])
+            model_files.append(member_summary["model_file"])
 
         ensemble_probabilities = np.mean(np.stack(member_probabilities, axis=0), axis=0)
         ensemble_loss = mean_cross_entropy(targets, ensemble_probabilities)
 
-        ensemble_prediction_path = output_dir / test_fold / "ensemble_predictions.csv"
+        ensemble_prediction_path = fold_dir / "ensemble_predictions.csv"
         export_prediction_frame(
             output_path=ensemble_prediction_path,
             image_paths=image_paths,
@@ -349,6 +407,7 @@ def run_dataset_experiment(
                 model_files=model_files,
             )
         )
+        write_json(fold_summary_path, fold_results[-1].to_dict())
 
     result = DatasetResult(
         dataset_name=dataset_name,
@@ -366,8 +425,7 @@ def run_dataset_experiment(
         config=serialize_config(config),
     )
 
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
-        json.dump(result.to_dict(), handle, indent=2)
+    write_json(summary_path, result.to_dict())
 
     return result
 
@@ -378,6 +436,7 @@ def train_single_model(
     num_classes: int,
     config: ImageExperimentConfig,
     seed: int,
+    checkpoint_dir: Path,
 ) -> tuple[nn.Module, dict[str, list[float]]]:
     set_seed(seed)
 
@@ -418,8 +477,21 @@ def train_single_model(
     best_val_loss = math.inf
     epochs_without_improvement = 0
     history = {"train_cross_entropy": [], "val_cross_entropy": []}
+    checkpoint_path = checkpoint_dir / "training_state.pt"
+    start_epoch = 0
 
-    for _ in range(config.epochs):
+    if checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, map_location=config.device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        best_state = checkpoint["best_state"]
+        best_val_loss = checkpoint["best_val_loss"]
+        epochs_without_improvement = checkpoint["epochs_without_improvement"]
+        history = checkpoint["history"]
+        start_epoch = checkpoint["completed_epochs"]
+        restore_rng_state(checkpoint["rng_state"])
+
+    for epoch_index in range(start_epoch, config.epochs):
         train_loss = run_epoch(model, train_loader, criterion, config.device, optimizer)
         val_loss = run_epoch(model, val_loader, criterion, config.device)
 
@@ -432,8 +504,22 @@ def train_single_model(
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
-            if epochs_without_improvement >= config.early_stopping_patience:
-                break
+        torch.save(
+            {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "best_state": best_state,
+                "best_val_loss": best_val_loss,
+                "epochs_without_improvement": epochs_without_improvement,
+                "completed_epochs": epoch_index + 1,
+                "history": history,
+                "rng_state": capture_rng_state(),
+            },
+            checkpoint_path,
+        )
+
+        if epochs_without_improvement >= config.early_stopping_patience:
+            break
 
     model.load_state_dict(best_state)
     model.eval()
@@ -581,9 +667,23 @@ def entropy_per_sample(distributions: np.ndarray) -> np.ndarray:
 
 def save_results_summary(output_root: Path, results: list[DatasetResult]):
     output_root.mkdir(parents=True, exist_ok=True)
-    payload = [result.to_dict() for result in results]
-    with (output_root / "results.json").open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
+    existing_payload: list[dict[str, Any]] = []
+    results_path = output_root / "results.json"
+    if results_path.exists():
+        with results_path.open("r", encoding="utf-8") as handle:
+            existing_payload = json.load(handle)
+
+    merged_by_dataset = {
+        item["dataset_name"]: item for item in existing_payload
+    }
+    for result in results:
+        merged_by_dataset[result.dataset_name] = result.to_dict()
+
+    payload = [
+        merged_by_dataset[dataset_name]
+        for dataset_name in sorted(merged_by_dataset)
+    ]
+    write_json(results_path, payload)
 
 
 def run_epoch(
@@ -673,3 +773,95 @@ def serialize_config(config: ImageExperimentConfig) -> dict[str, Any]:
         "seed": config.seed,
         "folds": config.folds,
     }
+
+
+def build_run_name(config: ImageExperimentConfig) -> str:
+    mode = "finetune" if not config.freeze_encoder else "head-only"
+    pretrained = "pretrained" if config.pretrained else "scratch"
+    fold_part = "all-folds" if not config.folds else "-".join(sorted(config.folds))
+    readable = (
+        f"{config.encoder_name}_{mode}_{pretrained}"
+        f"_ens{config.ensemble_size}"
+        f"_ep{config.epochs}"
+        f"_bs{config.batch_size}"
+        f"_seed{config.seed}"
+        f"_{fold_part}"
+    )
+    fingerprint = hashlib.sha256(
+        json.dumps(serialize_config(config), sort_keys=True).encode("utf-8")
+    ).hexdigest()[:10]
+    return f"{sanitize_path_token(readable)}_{fingerprint}"
+
+
+def sanitize_path_token(value: str) -> str:
+    return "".join(
+        character if character.isalnum() or character in {"-", "_"} else "-"
+        for character in value
+    ).strip("-")
+
+
+def capture_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: dict[str, Any]):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([tensor.cpu() for tensor in state["cuda"]])
+
+
+def write_json(path: Path, payload: Any):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def load_dataset_result(path: Path) -> DatasetResult:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return DatasetResult.from_dict(payload)
+
+
+def load_fold_result(path: Path) -> FoldResult:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return FoldResult.from_dict(payload)
+
+
+def load_member_summary_if_complete(member_dir: Path) -> dict[str, Any] | None:
+    summary_path = member_dir / "summary.json"
+    if not summary_path.exists():
+        return None
+    with summary_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    required_files = [
+        Path(payload["model_file"]),
+        Path(payload["prediction_file"]),
+        Path(payload["history_file"]),
+    ]
+    if all(path.exists() for path in required_files):
+        return payload
+    return None
+
+
+def load_prediction_frame(
+    prediction_path: Path,
+    class_names: list[str],
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    frame = pd.read_csv(prediction_path)
+    target_columns = [f"target::{class_name}" for class_name in class_names]
+    prediction_columns = [f"pred::{class_name}" for class_name in class_names]
+    return (
+        frame[prediction_columns].to_numpy(dtype=np.float32),
+        frame[target_columns].to_numpy(dtype=np.float32),
+        frame["image_path"].tolist(),
+    )

@@ -7,10 +7,12 @@ import torch
 
 from image_pipeline import (
     ImageExperimentConfig,
+    build_run_name,
     discover_image_datasets,
     list_available_encoders,
     run_dataset_experiment,
     save_results_summary,
+    write_json,
 )
 
 
@@ -80,12 +82,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def serialize_for_run(config: ImageExperimentConfig, dataset_names: list[str]) -> dict:
+    return {
+        "datasets": dataset_names,
+        "config": {
+            "data_root": str(config.data_root),
+            "output_root": str(config.output_root),
+            "encoder_name": config.encoder_name,
+            "pretrained": config.pretrained,
+            "freeze_encoder": config.freeze_encoder,
+            "ensemble_size": config.ensemble_size,
+            "batch_size": config.batch_size,
+            "epochs": config.epochs,
+            "learning_rate": config.learning_rate,
+            "weight_decay": config.weight_decay,
+            "validation_size": config.validation_size,
+            "early_stopping_patience": config.early_stopping_patience,
+            "num_workers": config.num_workers,
+            "device": config.device,
+            "seed": config.seed,
+            "folds": config.folds,
+        },
+    }
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
 
     dataset_names = args.datasets or discover_image_datasets(args.data_root) 
-    config = ImageExperimentConfig(
+    base_config = ImageExperimentConfig(
         data_root=args.data_root,
         output_root=args.output_root,
         encoder_name=args.encoder,
@@ -103,6 +129,29 @@ def main():
         seed=args.seed,
         folds=args.folds,
     )
+    run_name = build_run_name(base_config)
+    run_output_root = args.output_root / run_name
+    config = ImageExperimentConfig(
+        data_root=base_config.data_root,
+        output_root=run_output_root,
+        encoder_name=base_config.encoder_name,
+        pretrained=base_config.pretrained,
+        freeze_encoder=base_config.freeze_encoder,
+        ensemble_size=base_config.ensemble_size,
+        batch_size=base_config.batch_size,
+        epochs=base_config.epochs,
+        learning_rate=base_config.learning_rate,
+        weight_decay=base_config.weight_decay,
+        validation_size=base_config.validation_size,
+        early_stopping_patience=base_config.early_stopping_patience,
+        num_workers=base_config.num_workers,
+        device=base_config.device,
+        seed=base_config.seed,
+        folds=base_config.folds,
+    )
+    write_json(run_output_root / "config.json", serialize_for_run(config, dataset_names))
+
+    print(f"Run directory: {run_output_root}")
 
     results = []
     for dataset_name in dataset_names:
@@ -112,8 +161,7 @@ def main():
             f"  mean ensemble cross entropy: {result.mean_ensemble_cross_entropy:.4f}"
         )
         results.append(result)
-
-    save_results_summary(args.output_root, results)
+        save_results_summary(run_output_root, results)
 
     print("\nSummary")
     print("=" * 60)
