@@ -47,6 +47,7 @@ torch.set_float32_matmul_precision("high")
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+NORMALIZATION_STATS_FILE = "normalization_stats.json"
 
 DEFAULT_ENCODERS = {
     "resnet18": 224,
@@ -88,6 +89,7 @@ class ImageExperimentConfig:
     )
     seed: int = 42
     folds: list[str] | None = None
+    normalization: str = "imagenet"
 
 
 @dataclass(slots=True)
@@ -162,6 +164,12 @@ class DatasetResult:
             mean_ensemble_cross_entropy=payload["mean_ensemble_cross_entropy"],
             config=dict(payload["config"]),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizationStats:
+    mean: tuple[float, float, float]
+    std: tuple[float, float, float]
 
 
 class SoftLabelImageDataset(Dataset):
@@ -309,6 +317,12 @@ def run_dataset_experiment(
             continue
 
         fold_seed = config.seed + fold_offset
+        normalization_stats = resolve_normalization_stats(
+            dataset_name=dataset_name,
+            records=records,
+            test_fold=test_fold,
+            config=config,
+        )
 
         train_records = [record for record in records if record.fold != test_fold]
         test_records = [record for record in records if record.fold == test_fold]
@@ -338,12 +352,14 @@ def run_dataset_experiment(
                     config=config,
                     seed=member_seed,
                     checkpoint_dir=member_dir,
+                    normalization_stats=normalization_stats,
                 )
 
                 probabilities, targets, image_paths = predict_records(
                     model=model,
                     records=test_records,
                     config=config,
+                    normalization_stats=normalization_stats,
                 )
 
                 member_loss = mean_cross_entropy(targets, probabilities)
@@ -437,13 +453,14 @@ def train_single_model(
     config: ImageExperimentConfig,
     seed: int,
     checkpoint_dir: Path,
+    normalization_stats: NormalizationStats,
 ) -> tuple[nn.Module, dict[str, list[float]]]:
     set_seed(seed)
 
     train_loader = make_dataloader(
         data_root=config.data_root,
         records=train_records,
-        transform=build_transform(config, train=True),
+        transform=build_transform(config, train=True, normalization_stats=normalization_stats),
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
@@ -452,7 +469,7 @@ def train_single_model(
     val_loader = make_dataloader(
         data_root=config.data_root,
         records=val_records,
-        transform=build_transform(config, train=False),
+        transform=build_transform(config, train=False, normalization_stats=normalization_stats),
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
@@ -530,11 +547,12 @@ def predict_records(
     model: nn.Module,
     records: list[ImageRecord],
     config: ImageExperimentConfig,
+    normalization_stats: NormalizationStats,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     loader = make_dataloader(
         data_root=config.data_root,
         records=records,
-        transform=build_transform(config, train=False),
+        transform=build_transform(config, train=False, normalization_stats=normalization_stats),
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
@@ -581,7 +599,11 @@ def split_train_validation_records(
     return train_records, val_records
 
 
-def build_transform(config: ImageExperimentConfig, train: bool) -> transforms.Compose:
+def build_transform(
+    config: ImageExperimentConfig,
+    train: bool,
+    normalization_stats: NormalizationStats,
+) -> transforms.Compose:
     input_size = DEFAULT_ENCODERS[config.encoder_name]
 
     steps: list[Any] = []
@@ -593,7 +615,7 @@ def build_transform(config: ImageExperimentConfig, train: bool) -> transforms.Co
     steps.extend(
         [
             transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            transforms.Normalize(normalization_stats.mean, normalization_stats.std),
         ]
     )
     return transforms.Compose(steps)
@@ -772,6 +794,7 @@ def serialize_config(config: ImageExperimentConfig) -> dict[str, Any]:
         "device": config.device,
         "seed": config.seed,
         "folds": config.folds,
+        "normalization": config.normalization,
     }
 
 
@@ -779,6 +802,11 @@ def build_run_name(config: ImageExperimentConfig) -> str:
     mode = "finetune" if not config.freeze_encoder else "head-only"
     pretrained = "pretrained" if config.pretrained else "scratch"
     fold_part = "all-folds" if not config.folds else "-".join(sorted(config.folds))
+    normalization_part = (
+        ""
+        if config.normalization == "imagenet"
+        else f"_norm-{sanitize_path_token(config.normalization)}"
+    )
     readable = (
         f"{config.encoder_name}_{mode}_{pretrained}"
         f"_ens{config.ensemble_size}"
@@ -786,11 +814,19 @@ def build_run_name(config: ImageExperimentConfig) -> str:
         f"_bs{config.batch_size}"
         f"_seed{config.seed}"
         f"_{fold_part}"
+        f"{normalization_part}"
     )
     fingerprint = hashlib.sha256(
-        json.dumps(serialize_config(config), sort_keys=True).encode("utf-8")
+        json.dumps(serialize_config_for_run_name(config), sort_keys=True).encode("utf-8")
     ).hexdigest()[:10]
     return f"{sanitize_path_token(readable)}_{fingerprint}"
+
+
+def serialize_config_for_run_name(config: ImageExperimentConfig) -> dict[str, Any]:
+    payload = serialize_config(config)
+    if config.normalization == "imagenet":
+        payload.pop("normalization", None)
+    return payload
 
 
 def sanitize_path_token(value: str) -> str:
@@ -798,6 +834,86 @@ def sanitize_path_token(value: str) -> str:
         character if character.isalnum() or character in {"-", "_"} else "-"
         for character in value
     ).strip("-")
+
+
+def resolve_normalization_stats(
+    dataset_name: str,
+    records: list[ImageRecord],
+    test_fold: str,
+    config: ImageExperimentConfig,
+) -> NormalizationStats:
+    if config.normalization == "imagenet":
+        return NormalizationStats(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    if config.normalization != "dataset":
+        raise ValueError(f"Unsupported normalization mode: {config.normalization}")
+
+    dataset_dir = config.data_root / dataset_name
+    stats_payload = load_or_compute_dataset_normalization_stats(
+        dataset_dir=dataset_dir,
+        records=records,
+        data_root=config.data_root,
+    )
+    fold_stats = stats_payload["fold_stats"][test_fold]
+    return NormalizationStats(
+        mean=tuple(float(value) for value in fold_stats["mean"]),
+        std=tuple(float(value) for value in fold_stats["std"]),
+    )
+
+
+def load_or_compute_dataset_normalization_stats(
+    dataset_dir: Path,
+    records: list[ImageRecord],
+    data_root: Path,
+) -> dict[str, Any]:
+    stats_path = dataset_dir / NORMALIZATION_STATS_FILE
+    fold_names = sorted({record.fold for record in records})
+
+    if stats_path.exists():
+        with stats_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        cached_folds = sorted(payload.get("fold_stats", {}).keys())
+        if cached_folds == fold_names:
+            return payload
+
+    fold_stats: dict[str, dict[str, Any]] = {}
+    for held_out_fold in fold_names:
+        training_paths = [
+            data_root / record.image_path
+            for record in records
+            if record.fold != held_out_fold
+        ]
+        mean, std = compute_channel_stats(training_paths)
+        fold_stats[held_out_fold] = {
+            "mean": list(mean),
+            "std": list(std),
+            "num_images": len(training_paths),
+        }
+
+    payload = {
+        "mode": "dataset",
+        "description": "Per-held-out-fold RGB channel stats computed from all non-held-out folds.",
+        "fold_stats": fold_stats,
+    }
+    write_json(stats_path, payload)
+    return payload
+
+
+def compute_channel_stats(image_paths: list[Path]) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    channel_sum = np.zeros(3, dtype=np.float64)
+    channel_squared_sum = np.zeros(3, dtype=np.float64)
+    pixel_count = 0
+
+    for image_path in image_paths:
+        image = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.float32) / 255.0
+        flat = image.reshape(-1, 3)
+        channel_sum += flat.sum(axis=0)
+        channel_squared_sum += np.square(flat).sum(axis=0)
+        pixel_count += flat.shape[0]
+
+    mean = channel_sum / pixel_count
+    variance = channel_squared_sum / pixel_count - np.square(mean)
+    std = np.sqrt(np.clip(variance, a_min=1e-12, a_max=None))
+    return tuple(float(value) for value in mean), tuple(float(value) for value in std)
 
 
 def capture_rng_state() -> dict[str, Any]:

@@ -41,7 +41,7 @@ Image datasets should be stored under [data/image](data/image). Used datasets ca
 - For each given fold put all records that much this specific fold in the test set, all others in the train set
 - Split train set into train and validation sets
 - For the set number of ensemble members, train a model (each with different seed)
-	1. create train and validation dataloader, with set batch_size and transformations (currently normalization with imagenet mean + std, since pretrained models were trained on imagenet, as well as resize to expected input image size). Additionally also RandomHorizontalFlip currently for the train set
+	1. create train and validation dataloader, with set batch_size and transformations (default normalization uses imagenet mean + std, since pretrained models were trained on imagenet, as well as resize to expected input image size). Additionally also RandomHorizontalFlip currently for the train set
 	2. Initialize Model, based on passed model name (e.g. resnet18, resnet50, vit_b_16, etc.), replace classification head with linear layer and optionally freeze all layers leading up to classification head (--finetune in config if weights should not be frozen)
 	3. Set up optimizer (adamW) + loss (soft target cross entropy)
 	4. Begin training loop for set amount of epochs, (run_epoch for both training set, where gradients are calculated and weights are updated; once for validation set, where no weights are updated)
@@ -66,6 +66,14 @@ The implementation is in [image_pipeline.py](image_pipeline.py) and the CLI runn
 - frozen encoder by default, with a learned classification head
 - soft-target cross entropy loss
 - fold-based evaluation using the existing `fold1` ... `fold5` directories
+- `--normalization imagenet` by default
+
+### Normalization modes
+
+- `imagenet`: use `(0.485, 0.456, 0.406)` and `(0.229, 0.224, 0.225)`
+- `dataset`: compute and cache one RGB mean/std pair per held-out fold and dataset, using all non-held-out folds. The cache is stored as `normalization_stats.json` inside each dataset directory.
+
+For backward compatibility, ImageNet normalization keeps the previous run naming scheme. Only non-ImageNet normalization adds a normalization tag to the run directory name.
 
 ### Example commands
 
@@ -80,6 +88,10 @@ Fine-tune the full encoder instead of only the head:
 Quick smoke test on a small subset:
 
     python run_image_experiments.py --dataset CIFAR10H --encoder resnet18 --ensemble-size 1 --epochs 1 --max-train-samples 64 --max-test-samples 32 --workers 0
+
+Run with cached dataset-specific normalization:
+
+    python run_image_experiments.py --dataset Benthic --encoder resnet18 --normalization dataset
 
 ### Outputs
 

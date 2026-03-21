@@ -79,6 +79,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("data/image"),
         help="Directory containing the image datasets.",
     )
+    parser.add_argument(
+        "--normalization",
+        default="imagenet",
+        choices=["imagenet", "dataset"],
+        help=(
+            "Normalization mode. "
+            "'imagenet' keeps torchvision ImageNet stats. "
+            "'dataset' caches 5 RGB mean/std sets per dataset, one for each held-out fold, "
+            "computed from all non-held-out folds."
+        ),
+    )
     return parser
 
 
@@ -102,6 +113,7 @@ def serialize_for_run(config: ImageExperimentConfig, dataset_names: list[str]) -
             "device": config.device,
             "seed": config.seed,
             "folds": config.folds,
+            "normalization": config.normalization,
         },
     }
 
@@ -128,6 +140,7 @@ def main():
         device=args.device,
         seed=args.seed,
         folds=args.folds,
+        normalization=args.normalization,
     )
     run_name = build_run_name(base_config)
     run_output_root = args.output_root / run_name
@@ -148,6 +161,7 @@ def main():
         device=base_config.device,
         seed=base_config.seed,
         folds=base_config.folds,
+        normalization=base_config.normalization,
     )
     write_json(run_output_root / "config.json", serialize_for_run(config, dataset_names))
 
