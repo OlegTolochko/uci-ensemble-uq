@@ -52,6 +52,9 @@ NORMALIZATION_STATS_FILE = "normalization_stats.json"
 DEFAULT_ENCODERS = {
     "resnet18": 224,
     "resnet50": 224,
+    "wide_resnet50_2": 224,
+    "resnext50_32x4d": 224,
+    "densenet121": 224,
     "efficientnet_b0": 224,
     "convnext_tiny": 224,
     "vit_b_16": 224,
@@ -90,6 +93,8 @@ class ImageExperimentConfig:
     seed: int = 42
     folds: list[str] | None = None
     normalization: str = "imagenet"
+    classifier_dropout: float = 0.0
+    amp: bool = True
 
 
 @dataclass(slots=True)
@@ -201,8 +206,8 @@ class SoftTargetCrossEntropy(nn.Module):
         return -(targets * log_probs).sum(dim=1).mean()
 
 
-class TorchvisionSoftClassifier(nn.Module):
-    """Torchvision encoder with a new linear head."""
+class ImageSoftClassifier(nn.Module):
+    """Encoder with a replaceable classification head."""
 
     def __init__(
         self,
@@ -210,6 +215,7 @@ class TorchvisionSoftClassifier(nn.Module):
         num_classes: int,
         pretrained: bool,
         freeze_encoder: bool,
+        classifier_dropout: float,
     ):
         super().__init__()
 
@@ -221,7 +227,11 @@ class TorchvisionSoftClassifier(nn.Module):
         in_features = replace_classification_head_with_identity(
             self.encoder, encoder_name
         )
-        self.head = nn.Linear(in_features, num_classes)
+        self.head = build_classifier_head(
+            in_features=in_features,
+            num_classes=num_classes,
+            classifier_dropout=classifier_dropout,
+        )
 
         if freeze_encoder:
             for parameter in self.encoder.parameters():
@@ -236,6 +246,21 @@ class TorchvisionSoftClassifier(nn.Module):
 
 def list_available_encoders() -> list[str]:
     return sorted(DEFAULT_ENCODERS)
+
+
+def build_classifier_head(
+    *,
+    in_features: int,
+    num_classes: int,
+    classifier_dropout: float,
+) -> nn.Module:
+    if classifier_dropout > 0:
+        return nn.Sequential(
+            nn.Dropout(classifier_dropout),
+            nn.Linear(in_features, num_classes),
+        )
+
+    return nn.Linear(in_features, num_classes)
 
 
 def discover_image_datasets(data_root: Path) -> list[str]:
@@ -476,11 +501,12 @@ def train_single_model(
         pin_memory=config.device.startswith("cuda"),
     )
 
-    model = TorchvisionSoftClassifier(
+    model = ImageSoftClassifier(
         encoder_name=config.encoder_name,
         num_classes=num_classes,
         pretrained=config.pretrained,
         freeze_encoder=config.freeze_encoder,
+        classifier_dropout=config.classifier_dropout,
     ).to(config.device)
 
     optimizer = torch.optim.AdamW(
@@ -489,6 +515,8 @@ def train_single_model(
         weight_decay=config.weight_decay,
     )
     criterion = SoftTargetCrossEntropy()
+    use_amp = config.amp and config.device.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     best_state = copy.deepcopy(model.state_dict())
     best_val_loss = math.inf
@@ -501,6 +529,8 @@ def train_single_model(
         checkpoint = torch.load(checkpoint_path, map_location=config.device, weights_only=False)
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
+        if checkpoint.get("scaler_state") is not None:
+            scaler.load_state_dict(checkpoint["scaler_state"])
         best_state = checkpoint["best_state"]
         best_val_loss = checkpoint["best_val_loss"]
         epochs_without_improvement = checkpoint["epochs_without_improvement"]
@@ -509,8 +539,22 @@ def train_single_model(
         restore_rng_state(checkpoint["rng_state"])
 
     for epoch_index in range(start_epoch, config.epochs):
-        train_loss = run_epoch(model, train_loader, criterion, config.device, optimizer)
-        val_loss = run_epoch(model, val_loader, criterion, config.device)
+        train_loss = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            config.device,
+            optimizer,
+            scaler=scaler,
+            use_amp=use_amp,
+        )
+        val_loss = run_epoch(
+            model,
+            val_loader,
+            criterion,
+            config.device,
+            use_amp=use_amp,
+        )
 
         history["train_cross_entropy"].append(train_loss)
         history["val_cross_entropy"].append(val_loss)
@@ -525,6 +569,7 @@ def train_single_model(
             {
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
+                "scaler_state": scaler.state_dict() if use_amp else None,
                 "best_state": best_state,
                 "best_val_loss": best_val_loss,
                 "epochs_without_improvement": epochs_without_improvement,
@@ -566,7 +611,12 @@ def predict_records(
     model.eval()
     with torch.no_grad():
         for images, targets, image_paths in loader:
-            logits = model(images.to(config.device))
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=config.amp and config.device.startswith("cuda"),
+            ):
+                logits = model(images.to(config.device))
             probabilities = torch.softmax(logits, dim=1).cpu().numpy()
             all_probabilities.append(probabilities)
             all_targets.append(targets.numpy())
@@ -714,6 +764,9 @@ def run_epoch(
     criterion: nn.Module,
     device: str,
     optimizer: torch.optim.Optimizer | None = None,
+    *,
+    scaler: torch.amp.GradScaler | None = None,
+    use_amp: bool = False,
 ) -> float:
     is_training = optimizer is not None
     model.train(mode=is_training)
@@ -725,13 +778,23 @@ def run_epoch(
         for images, targets, _ in loader:
             images = images.to(device)
             targets = targets.to(device)
-            logits = model(images)
-            loss = criterion(logits, targets)
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=use_amp,
+            ):
+                logits = model(images)
+                loss = criterion(logits, targets)
 
             if is_training:
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                if scaler is not None and use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
             batch_size = images.shape[0]
             total_loss += float(loss.item()) * batch_size
@@ -745,9 +808,14 @@ def replace_classification_head_with_identity(
 ) -> int:
     """Remove the ImageNet classifier so we can attach our own output layer. (more may be added)"""
 
-    if encoder_name in {"resnet18", "resnet50"}:
+    if encoder_name in {"resnet18", "resnet50", "wide_resnet50_2", "resnext50_32x4d"}:
         in_features = int(model.fc.in_features)
         model.fc = nn.Identity()
+        return in_features
+
+    if encoder_name == "densenet121":
+        in_features = int(model.classifier.in_features)
+        model.classifier = nn.Identity()
         return in_features
 
     if encoder_name in {"efficientnet_b0", "convnext_tiny"}:
@@ -795,6 +863,8 @@ def serialize_config(config: ImageExperimentConfig) -> dict[str, Any]:
         "seed": config.seed,
         "folds": config.folds,
         "normalization": config.normalization,
+        "classifier_dropout": config.classifier_dropout,
+        "amp": config.amp,
     }
 
 
@@ -814,6 +884,7 @@ def build_run_name(config: ImageExperimentConfig) -> str:
         f"_bs{config.batch_size}"
         f"_seed{config.seed}"
         f"_{fold_part}"
+        f"{'_amp' if config.amp else '_fp32'}"
         f"{normalization_part}"
     )
     fingerprint = hashlib.sha256(
