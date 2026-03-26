@@ -410,6 +410,7 @@ def run_dataset_experiment(
                     "history_file": str(member_prediction_path.with_name("history.json")),
                 }
                 write_json(member_dir / "summary.json", member_summary)
+                cleanup_training_state(member_dir)
             else:
                 probabilities, targets, image_paths = load_prediction_frame(
                     Path(member_summary["prediction_file"]),
@@ -756,6 +757,12 @@ def save_results_summary(output_root: Path, results: list[DatasetResult]):
         for dataset_name in sorted(merged_by_dataset)
     ]
     write_json(results_path, payload)
+
+
+def cleanup_training_state(member_dir: Path) -> None:
+    training_state_path = member_dir / "training_state.pt"
+    if training_state_path.exists():
+        training_state_path.unlink()
 
 
 def run_epoch(
