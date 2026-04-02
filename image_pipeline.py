@@ -26,6 +26,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+from image_loss_variants import SoftTargetTrainingLoss
 from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch import nn
@@ -94,6 +96,10 @@ class ImageExperimentConfig:
     folds: list[str] | None = None
     normalization: str = "imagenet"
     classifier_dropout: float = 0.0
+    lambda_reg: float = 0.0
+    prob_regularizer: str = "none"
+    prob_regularizer_weight: float = 0.0
+    entropy_bonus_weight: float = 0.0
     amp: bool = True
 
 
@@ -242,6 +248,18 @@ class ImageSoftClassifier(nn.Module):
         if features.ndim > 2: # if the encoder doesn't already pool to (batch_size, features)
             features = torch.flatten(features, start_dim=1)
         return self.head(features)
+    
+class RegularizerDare(nn.Module):
+    def __init__(self, lambda_reg: float = 0.01, epsilon: float = 1e-12):
+        super().__init__()
+        self.lambda_reg = lambda_reg
+        self.epsilon = epsilon
+
+    def forward(self, model: nn.Module) -> torch.Tensor:
+        total_loss = torch.zeros((), device=next(model.parameters()).device)
+        for param in model.parameters():
+            total_loss += (param.square() + self.epsilon).log2().sum()
+        return total_loss * self.lambda_reg
 
 
 def list_available_encoders() -> list[str]:
@@ -389,7 +407,7 @@ def run_dataset_experiment(
 
                 member_loss = mean_cross_entropy(targets, probabilities)
                 model_path = member_dir / "model.pt"
-                torch.save(model.state_dict(), model_path)
+                atomic_torch_save(model.state_dict(), model_path)
 
                 member_prediction_path = member_dir / "predictions.csv"
                 export_prediction_frame(
@@ -515,9 +533,14 @@ def train_single_model(
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-    criterion = SoftTargetCrossEntropy()
+    criterion = SoftTargetTrainingLoss(
+        prob_regularizer=config.prob_regularizer,
+        prob_regularizer_weight=config.prob_regularizer_weight,
+        entropy_bonus_weight=config.entropy_bonus_weight,
+    )
     use_amp = config.amp and config.device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    regularizer = RegularizerDare(lambda_reg=config.lambda_reg) if config.lambda_reg > 0 else None
 
     best_state = copy.deepcopy(model.state_dict())
     best_val_loss = math.inf
@@ -547,7 +570,9 @@ def train_single_model(
             config.device,
             optimizer,
             scaler=scaler,
+            regularizer=regularizer,
             use_amp=use_amp,
+            epoch_index=epoch_index,
         )
         val_loss = run_epoch(
             model,
@@ -566,7 +591,7 @@ def train_single_model(
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
-        torch.save(
+        atomic_torch_save(
             {
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
@@ -618,7 +643,12 @@ def predict_records(
                 enabled=config.amp and config.device.startswith("cuda"),
             ):
                 logits = model(images.to(config.device))
-            probabilities = torch.softmax(logits, dim=1).cpu().numpy()
+            probabilities = (
+                torch.softmax(logits.float(), dim=1)
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
             all_probabilities.append(probabilities)
             all_targets.append(targets.numpy())
             all_paths.extend(image_paths)
@@ -729,12 +759,14 @@ def mean_cross_entropy(targets: np.ndarray, probabilities: np.ndarray) -> float:
 def cross_entropy_per_sample(
     targets: np.ndarray, probabilities: np.ndarray
 ) -> np.ndarray:
-    clipped = np.clip(probabilities, 1e-8, 1.0)
-    return -(targets * np.log(clipped)).sum(axis=1)
+    safe_targets = np.asarray(targets, dtype=np.float64)
+    safe_probabilities = np.asarray(probabilities, dtype=np.float64)
+    clipped = np.clip(safe_probabilities, 1e-8, 1.0)
+    return -(safe_targets * np.log(clipped)).sum(axis=1)
 
 
 def entropy_per_sample(distributions: np.ndarray) -> np.ndarray:
-    clipped = np.clip(distributions, 1e-8, 1.0)
+    clipped = np.clip(np.asarray(distributions, dtype=np.float64), 1e-8, 1.0)
     return -(clipped * np.log(clipped)).sum(axis=1)
 
 
@@ -765,6 +797,17 @@ def cleanup_training_state(member_dir: Path) -> None:
         training_state_path.unlink()
 
 
+def atomic_torch_save(payload: Any, output_path: Path) -> None:
+    """Write checkpoints atomically so failed saves do not leave partial files."""
+    temp_path = output_path.with_name(f"{output_path.name}.tmp")
+    try:
+        torch.save(payload, temp_path)
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -773,7 +816,9 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     *,
     scaler: torch.amp.GradScaler | None = None,
+    regularizer: RegularizerDare | None = None,
     use_amp: bool = False,
+    epoch_index: int | None = None,
 ) -> float:
     is_training = optimizer is not None
     model.train(mode=is_training)
@@ -792,6 +837,8 @@ def run_epoch(
             ):
                 logits = model(images)
                 loss = criterion(logits, targets)
+                if regularizer is not None and epoch_index is not None:
+                    loss = loss - min(1.0, epoch_index / 10) * regularizer(model)
 
             if is_training:
                 optimizer.zero_grad(set_to_none=True)
@@ -871,6 +918,10 @@ def serialize_config(config: ImageExperimentConfig) -> dict[str, Any]:
         "folds": config.folds,
         "normalization": config.normalization,
         "classifier_dropout": config.classifier_dropout,
+        "lambda_reg": config.lambda_reg,
+        "prob_regularizer": config.prob_regularizer,
+        "prob_regularizer_weight": config.prob_regularizer_weight,
+        "entropy_bonus_weight": config.entropy_bonus_weight,
         "amp": config.amp,
     }
 
@@ -884,6 +935,21 @@ def build_run_name(config: ImageExperimentConfig) -> str:
         if config.normalization == "imagenet"
         else f"_norm-{sanitize_path_token(config.normalization)}"
     )
+    regularizer_part = (
+        ""
+        if config.lambda_reg <= 0
+        else f"_reg-{sanitize_path_token(f'{config.lambda_reg:g}')}"
+    )
+    prob_regularizer_part = (
+        ""
+        if config.prob_regularizer == "none" or config.prob_regularizer_weight <= 0
+        else f"_preg-{sanitize_path_token(config.prob_regularizer)}-{sanitize_path_token(f'{config.prob_regularizer_weight:g}')}"
+    )
+    entropy_bonus_part = (
+        ""
+        if config.entropy_bonus_weight <= 0
+        else f"_ent-{sanitize_path_token(f'{config.entropy_bonus_weight:g}')}"
+    )
     readable = (
         f"{config.encoder_name}_{mode}_{pretrained}"
         f"_ens{config.ensemble_size}"
@@ -892,6 +958,9 @@ def build_run_name(config: ImageExperimentConfig) -> str:
         f"_seed{config.seed}"
         f"_{fold_part}"
         f"{'_amp' if config.amp else '_fp32'}"
+        f"{regularizer_part}"
+        f"{prob_regularizer_part}"
+        f"{entropy_bonus_part}"
         f"{normalization_part}"
     )
     fingerprint = hashlib.sha256(
