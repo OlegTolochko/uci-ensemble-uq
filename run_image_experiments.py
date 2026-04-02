@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 import torch
+from image_augmentations import AUGMENTATION_MODES
 from image_loss_variants import PROB_REGULARIZERS
 
 from image_pipeline import (
@@ -122,6 +123,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--augmentation",
+        default="basic",
+        choices=AUGMENTATION_MODES,
+        help=(
+            "Training-time augmentation policy. "
+            "'basic' keeps the current random horizontal flip baseline. "
+            "'dcic_auto' mirrors the dcic paper setup by disabling augmentation for "
+            "CIFAR10H and QualityMRI and using the fuller bundle elsewhere."
+        ),
+    )
+    parser.add_argument(
         "--amp",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -151,6 +163,7 @@ def serialize_for_run(config: ImageExperimentConfig, dataset_names: list[str]) -
             "seed": config.seed,
             "folds": config.folds,
             "normalization": config.normalization,
+            "augmentation": config.augmentation,
             "classifier_dropout": config.classifier_dropout,
             "lambda_reg": config.lambda_reg,
             "prob_regularizer": config.prob_regularizer,
@@ -189,6 +202,7 @@ def main():
         seed=args.seed,
         folds=args.folds,
         normalization=args.normalization,
+        augmentation=args.augmentation,
         amp=args.amp,
     )
     run_name = build_run_name(base_config)
@@ -216,6 +230,7 @@ def main():
         seed=base_config.seed,
         folds=base_config.folds,
         normalization=base_config.normalization,
+        augmentation=base_config.augmentation,
         amp=base_config.amp,
     )
     write_json(run_output_root / "config.json", serialize_for_run(config, dataset_names))

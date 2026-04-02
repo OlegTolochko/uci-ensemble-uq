@@ -36,6 +36,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+from image_augmentations import build_train_augmentation_steps
 from image_loss_variants import SoftTargetTrainingLoss
 from PIL import Image
 from sklearn.model_selection import train_test_split
@@ -95,6 +96,7 @@ class ImageExperimentConfig:
     seed: int = 42
     folds: list[str] | None = None
     normalization: str = "imagenet"
+    augmentation: str = "basic"
     classifier_dropout: float = 0.0
     lambda_reg: float = 0.0
     prob_regularizer: str = "none"
@@ -382,58 +384,19 @@ def run_dataset_experiment(
         model_files: list[str] = []
 
         for member_index in range(config.ensemble_size):
-            member_seed = fold_seed + 97 * member_index
-            member_dir = fold_dir / f"member_{member_index:02d}"
-            member_dir.mkdir(parents=True, exist_ok=True)
-            member_summary = load_member_summary_if_complete(member_dir)
-
-            if member_summary is None:
-                model, history = train_single_model(
-                    train_records=train_records,
-                    val_records=val_records,
-                    num_classes=len(class_names),
-                    config=config,
-                    seed=member_seed,
-                    checkpoint_dir=member_dir,
-                    normalization_stats=normalization_stats,
-                )
-
-                probabilities, targets, image_paths = predict_records(
-                    model=model,
-                    records=test_records,
-                    config=config,
-                    normalization_stats=normalization_stats,
-                )
-
-                member_loss = mean_cross_entropy(targets, probabilities)
-                model_path = member_dir / "model.pt"
-                atomic_torch_save(model.state_dict(), model_path)
-
-                member_prediction_path = member_dir / "predictions.csv"
-                export_prediction_frame(
-                    output_path=member_prediction_path,
-                    image_paths=image_paths,
-                    targets=targets,
-                    probabilities=probabilities,
-                    class_names=class_names,
-                    fold_name=test_fold,
-                    history=history,
-                )
-                member_summary = {
-                    "member_index": member_index,
-                    "member_seed": member_seed,
-                    "cross_entropy": member_loss,
-                    "model_file": str(model_path),
-                    "prediction_file": str(member_prediction_path),
-                    "history_file": str(member_prediction_path.with_name("history.json")),
-                }
-                write_json(member_dir / "summary.json", member_summary)
-                cleanup_training_state(member_dir)
-            else:
-                probabilities, targets, image_paths = load_prediction_frame(
-                    Path(member_summary["prediction_file"]),
-                    class_names=class_names,
-                )
+            probabilities, targets, member_summary, image_paths = train_single_member(
+                member_index=member_index,
+                fold_seed=fold_seed,
+                fold_dir=fold_dir,
+                test_fold=test_fold,
+                train_records=train_records,
+                val_records=val_records,
+                test_records=test_records,
+                class_names=class_names,
+                dataset_name=dataset_name,
+                config=config,
+                normalization_stats=normalization_stats,
+            )
 
             member_probabilities.append(probabilities)
             member_losses.append(float(member_summary["cross_entropy"]))
@@ -490,10 +453,81 @@ def run_dataset_experiment(
     return result
 
 
+def train_single_member(
+    member_index: int,
+    fold_seed: int,
+    fold_dir: Path,
+    test_fold: str,
+    train_records: list[ImageRecord],
+    val_records: list[ImageRecord],
+    test_records: list[ImageRecord],
+    class_names: list[str],
+    dataset_name: str,
+    config: ImageExperimentConfig,
+    normalization_stats: NormalizationStats,
+) -> tuple[np.ndarray, np.ndarray, dict[str, any], list[str]]:
+    member_seed = fold_seed + 97 * member_index
+    member_dir = fold_dir / f"member_{member_index:02d}"
+    member_dir.mkdir(parents=True, exist_ok=True)
+    member_summary = load_member_summary_if_complete(member_dir)
+
+    if member_summary is None:
+        model, history = train_single_model(
+            train_records=train_records,
+            val_records=val_records,
+            num_classes=len(class_names),
+            dataset_name=dataset_name,
+            config=config,
+            seed=member_seed,
+            checkpoint_dir=member_dir,
+            normalization_stats=normalization_stats,
+        )
+
+        probabilities, targets, image_paths = predict_records(
+            model=model,
+            records=test_records,
+            dataset_name=dataset_name,
+            config=config,
+            normalization_stats=normalization_stats,
+        )
+
+        member_loss = mean_cross_entropy(targets, probabilities)
+        model_path = member_dir / "model.pt"
+        atomic_torch_save(model.state_dict(), model_path)
+
+        member_prediction_path = member_dir / "predictions.csv"
+        export_prediction_frame(
+            output_path=member_prediction_path,
+            image_paths=image_paths,
+            targets=targets,
+            probabilities=probabilities,
+            class_names=class_names,
+            fold_name=test_fold,
+            history=history,
+        )
+        member_summary = {
+            "member_index": member_index,
+            "member_seed": member_seed,
+            "cross_entropy": member_loss,
+            "model_file": str(model_path),
+            "prediction_file": str(member_prediction_path),
+            "history_file": str(member_prediction_path.with_name("history.json")),
+        }
+        write_json(member_dir / "summary.json", member_summary)
+        cleanup_training_state(member_dir)
+    else:
+        probabilities, targets, image_paths = load_prediction_frame(
+            Path(member_summary["prediction_file"]),
+            class_names=class_names,
+        )
+    return probabilities, targets, member_summary, image_paths
+
+
 def train_single_model(
     train_records: list[ImageRecord],
     val_records: list[ImageRecord],
     num_classes: int,
+    dataset_name: str,
     config: ImageExperimentConfig,
     seed: int,
     checkpoint_dir: Path,
@@ -504,7 +538,12 @@ def train_single_model(
     train_loader = make_dataloader(
         data_root=config.data_root,
         records=train_records,
-        transform=build_transform(config, train=True, normalization_stats=normalization_stats),
+        transform=build_transform(
+            config,
+            dataset_name=dataset_name,
+            train=True,
+            normalization_stats=normalization_stats,
+        ),
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
@@ -513,7 +552,12 @@ def train_single_model(
     val_loader = make_dataloader(
         data_root=config.data_root,
         records=val_records,
-        transform=build_transform(config, train=False, normalization_stats=normalization_stats),
+        transform=build_transform(
+            config,
+            dataset_name=dataset_name,
+            train=False,
+            normalization_stats=normalization_stats,
+        ),
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
@@ -617,13 +661,19 @@ def train_single_model(
 def predict_records(
     model: nn.Module,
     records: list[ImageRecord],
+    dataset_name: str,
     config: ImageExperimentConfig,
     normalization_stats: NormalizationStats,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     loader = make_dataloader(
         data_root=config.data_root,
         records=records,
-        transform=build_transform(config, train=False, normalization_stats=normalization_stats),
+        transform=build_transform(
+            config,
+            dataset_name=dataset_name,
+            train=False,
+            normalization_stats=normalization_stats,
+        ),
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
@@ -682,6 +732,7 @@ def split_train_validation_records(
 
 def build_transform(
     config: ImageExperimentConfig,
+    dataset_name: str,
     train: bool,
     normalization_stats: NormalizationStats,
 ) -> transforms.Compose:
@@ -689,7 +740,13 @@ def build_transform(
 
     steps: list[Any] = []
     if train:
-        steps.append(transforms.RandomHorizontalFlip())
+        steps.extend(
+            build_train_augmentation_steps(
+                mode=config.augmentation,
+                dataset_name=dataset_name,
+                input_size=input_size,
+            )
+        )
 
     steps.append(transforms.Resize((input_size, input_size)))
 
@@ -917,6 +974,7 @@ def serialize_config(config: ImageExperimentConfig) -> dict[str, Any]:
         "seed": config.seed,
         "folds": config.folds,
         "normalization": config.normalization,
+        "augmentation": config.augmentation,
         "classifier_dropout": config.classifier_dropout,
         "lambda_reg": config.lambda_reg,
         "prob_regularizer": config.prob_regularizer,
@@ -934,6 +992,11 @@ def build_run_name(config: ImageExperimentConfig) -> str:
         ""
         if config.normalization == "imagenet"
         else f"_norm-{sanitize_path_token(config.normalization)}"
+    )
+    augmentation_part = (
+        ""
+        if config.augmentation == "basic"
+        else f"_aug-{sanitize_path_token(config.augmentation)}"
     )
     regularizer_part = (
         ""
@@ -962,6 +1025,7 @@ def build_run_name(config: ImageExperimentConfig) -> str:
         f"{prob_regularizer_part}"
         f"{entropy_bonus_part}"
         f"{normalization_part}"
+        f"{augmentation_part}"
     )
     fingerprint = hashlib.sha256(
         json.dumps(serialize_config_for_run_name(config), sort_keys=True).encode("utf-8")
@@ -973,6 +1037,8 @@ def serialize_config_for_run_name(config: ImageExperimentConfig) -> dict[str, An
     payload = serialize_config(config)
     if config.normalization == "imagenet":
         payload.pop("normalization", None)
+    if config.augmentation == "basic":
+        payload.pop("augmentation", None)
     return payload
 
 
