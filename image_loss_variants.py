@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 
-PROB_REGULARIZERS = ("none", "l1", "brier")
+PROB_REGULARIZERS = ("none", "l1", "brier", "probability_distance")
 
 
 class SoftTargetTrainingLoss(nn.Module):
@@ -36,6 +36,10 @@ class SoftTargetTrainingLoss(nn.Module):
                 loss = loss + self.prob_regularizer_weight * distances.abs().sum(dim=1).mean()
             elif self.prob_regularizer == "brier":
                 loss = loss + self.prob_regularizer_weight * distances.square().sum(dim=1).mean()
+            elif self.prob_regularizer == "probability_distance":
+                _, highest_target_prob_idx = targets.max(dim=1)
+                distance_to_highest_target = distances.gather(1, highest_target_prob_idx.unsqueeze(1)).squeeze(1)
+                loss = loss + self.prob_regularizer_weight * distance_to_highest_target.mean()
 
         if self.entropy_bonus_weight > 0:
             safe_probabilities = probabilities.clamp_min(1e-8)
