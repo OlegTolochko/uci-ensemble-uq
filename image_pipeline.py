@@ -855,7 +855,6 @@ def cleanup_training_state(member_dir: Path) -> None:
 
 
 def atomic_torch_save(payload: Any, output_path: Path) -> None:
-    """Write checkpoints atomically so failed saves do not leave partial files."""
     temp_path = output_path.with_name(f"{output_path.name}.tmp")
     try:
         torch.save(payload, temp_path)

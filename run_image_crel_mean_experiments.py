@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -107,7 +108,7 @@ def main() -> None:
     args = parser.parse_args()
 
     dataset_names = args.datasets or discover_image_datasets(args.data_root)
-    base_config = CreRLMeanImageExperimentConfig(
+    config = CreRLMeanImageExperimentConfig(
         data_root=args.data_root,
         output_root=args.output_root,
         encoder_name=args.encoder,
@@ -131,32 +132,9 @@ def main() -> None:
         alpha=args.alpha,
         tobias_strength=args.tobias_strength,
     )
-    run_name = build_run_name(base_config)
+    run_name = build_run_name(config)
     run_output_root = args.output_root / run_name
-    config = CreRLMeanImageExperimentConfig(
-        data_root=base_config.data_root,
-        output_root=run_output_root,
-        encoder_name=base_config.encoder_name,
-        pretrained=base_config.pretrained,
-        freeze_encoder=base_config.freeze_encoder,
-        ensemble_size=base_config.ensemble_size,
-        batch_size=base_config.batch_size,
-        epochs=base_config.epochs,
-        learning_rate=base_config.learning_rate,
-        weight_decay=base_config.weight_decay,
-        validation_size=base_config.validation_size,
-        early_stopping_patience=base_config.early_stopping_patience,
-        num_workers=base_config.num_workers,
-        device=base_config.device,
-        seed=base_config.seed,
-        folds=base_config.folds,
-        normalization=base_config.normalization,
-        augmentation=base_config.augmentation,
-        classifier_dropout=base_config.classifier_dropout,
-        amp=base_config.amp,
-        alpha=base_config.alpha,
-        tobias_strength=base_config.tobias_strength,
-    )
+    config = replace(config, output_root=run_output_root)
     write_json(run_output_root / "config.json", serialize_for_run(config, dataset_names))
 
     print(f"Run directory: {run_output_root}")

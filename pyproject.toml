@@ -15,4 +15,5 @@ dependencies = [
     "tabpfn-extensions[many-classes]>=0.0.4",
     "torch>=2.10.0",
     "torchvision>=0.25.0",
+    "wandb>=0.25.1",
 ]

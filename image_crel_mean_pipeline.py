@@ -27,7 +27,6 @@ from image_pipeline import (
     load_dataset_result,
     load_fold_result,
     load_image_dataset,
-    load_member_summary_if_complete,
     load_prediction_frame,
     make_dataloader,
     mean_cross_entropy,
@@ -77,23 +76,17 @@ def apply_tobias_initialization(
     member_index: int,
     tobias_strength: float,
 ) -> None:
-    head = model.head
-    final_linear: nn.Linear
-    if isinstance(head, nn.Sequential):
-        final_linear = head[-1]
-    elif isinstance(head, nn.Linear):
-        final_linear = head
-    else:
-        raise TypeError(f"Unsupported head type for ToBias: {type(head)!r}")
-
+    final_linear = model.head[-1] if isinstance(model.head, nn.Sequential) else model.head
     target_class = member_index % num_classes
     with torch.no_grad():
         final_linear.bias[target_class] = tobias_strength
+
 
 def build_tau_schedule(*, alpha: float, ensemble_size: int) -> list[float]:
     if ensemble_size <= 1:
         return [1.0]
     return [float(value) for value in np.linspace(alpha, 1.0, num=ensemble_size)]
+
 
 def run_dataset_experiment(
     dataset_name: str,
@@ -108,6 +101,8 @@ def run_dataset_experiment(
         return load_dataset_result(summary_path)
 
     class_names, records = load_image_dataset(config.data_root / dataset_name)
+    num_classes = len(class_names)
+    standard_config = to_standard_config(config)
     fold_names = config.folds or sorted({record.fold for record in records})
     fold_results: list[FoldResult] = []
 
@@ -124,7 +119,7 @@ def run_dataset_experiment(
             dataset_name=dataset_name,
             records=records,
             test_fold=test_fold,
-            config=to_standard_config(config),
+            config=standard_config,
         )
         train_records = [record for record in records if record.fold != test_fold]
         test_records = [record for record in records if record.fold == test_fold]
@@ -136,18 +131,17 @@ def run_dataset_experiment(
 
         h_ml_dir = fold_dir / "h_ml"
         h_ml_dir.mkdir(parents=True, exist_ok=True)
-        _, _, h_ml_train_loss_sum = train_or_load_h_ml(
+        h_ml_train_loss_sum = train_or_load_h_ml(
             dataset_name=dataset_name,
             train_records=train_records,
             val_records=val_records,
-            num_classes=len(class_names),
+            num_classes=num_classes,
             config=config,
             seed=fold_seed,
             checkpoint_dir=h_ml_dir,
             normalization_stats=normalization_stats,
         )
         h_ml_train_ce_mean = float(h_ml_train_loss_sum / max(len(train_records), 1))
-        h_ml_train_log_likelihood_mean = float(-h_ml_train_ce_mean)
 
         tau_values = build_tau_schedule(
             alpha=config.alpha,
@@ -163,22 +157,23 @@ def run_dataset_experiment(
             member_seed = fold_seed + 97 * member_index
             member_dir = fold_dir / f"member_{member_index:02d}"
             member_dir.mkdir(parents=True, exist_ok=True)
-            member_summary = load_member_summary_if_complete(member_dir)
+            member_summary_path = member_dir / "summary.json"
+            member_summary = None
+            if member_summary_path.exists():
+                with member_summary_path.open("r", encoding="utf-8") as handle:
+                    member_summary = json.load(handle)
 
             if member_summary is None:
                 (
                     model,
                     history,
                     reached_epoch,
-                    initial_train_ce_mean,
-                    initial_train_log_likelihood_mean,
-                    target_train_ce_mean,
                     final_train_ce_mean,
                     final_relative_likelihood,
                 ) = train_crel_mean_member_model(
                     dataset_name=dataset_name,
                     train_records=train_records,
-                    num_classes=len(class_names),
+                    num_classes=num_classes,
                     config=config,
                     seed=member_seed,
                     checkpoint_dir=member_dir,
@@ -186,13 +181,12 @@ def run_dataset_experiment(
                     member_index=member_index,
                     tau=tau,
                     h_ml_train_ce_mean=h_ml_train_ce_mean,
-                    h_ml_train_log_likelihood_mean=h_ml_train_log_likelihood_mean,
                 )
                 probabilities, targets, image_paths = predict_records(
                     model=model,
                     records=test_records,
                     dataset_name=dataset_name,
-                    config=to_standard_config(config),
+                    config=standard_config,
                     normalization_stats=normalization_stats,
                 )
                 member_loss = mean_cross_entropy(targets, probabilities)
@@ -216,16 +210,11 @@ def run_dataset_experiment(
                     "prediction_file": str(member_prediction_path),
                     "history_file": str(member_prediction_path.with_name("history.json")),
                     "tau": float(tau),
-                    "initial_train_cross_entropy_mean": float(initial_train_ce_mean),
-                    "initial_train_log_likelihood_mean": float(initial_train_log_likelihood_mean),
-                    "target_train_cross_entropy_mean": float(target_train_ce_mean),
-                    "h_ml_train_cross_entropy_mean": float(h_ml_train_ce_mean),
                     "final_train_cross_entropy_mean": float(final_train_ce_mean),
                     "final_relative_likelihood": float(final_relative_likelihood),
-                    "reached_threshold": bool(final_relative_likelihood >= float(tau)),
                     "stopped_epoch": reached_epoch,
                 }
-                write_json(member_dir / "summary.json", member_summary)
+                write_json(member_summary_path, member_summary)
                 cleanup_training_state(member_dir)
             else:
                 probabilities, targets, image_paths = load_prediction_frame(
@@ -265,20 +254,6 @@ def run_dataset_experiment(
         fold_results.append(fold_result)
         write_json(fold_summary_path, fold_result.to_dict())
 
-        write_json(
-            fold_dir / "h_ml" / "summary.json",
-            {
-                "model_file": str(fold_dir / "h_ml" / "model.pt"),
-                "history_file": str(fold_dir / "h_ml" / "history.json"),
-                "train_loss_sum": float(h_ml_train_loss_sum),
-                "train_cross_entropy_mean": float(h_ml_train_ce_mean),
-                "train_log_likelihood_mean": float(h_ml_train_log_likelihood_mean),
-                "alpha": config.alpha,
-                "tau_values": [float(value) for value in tau_values],
-                "tobias_strength": config.tobias_strength,
-            },
-        )
-
     result = DatasetResult(
         dataset_name=dataset_name,
         encoder_name=config.encoder_name,
@@ -308,8 +283,7 @@ def train_crel_mean_member_model(
     member_index: int,
     tau: float,
     h_ml_train_ce_mean: float,
-    h_ml_train_log_likelihood_mean: float,
-) -> tuple[nn.Module, dict[str, list[float]], int, float, float, float, float, float]:
+) -> tuple[nn.Module, dict[str, list[float]], int, float, float]:
     set_seed(seed)
     standard_config = to_standard_config(config)
     train_loader = make_dataloader(
@@ -371,21 +345,12 @@ def train_crel_mean_member_model(
         device=config.device,
         use_amp=use_amp,
     )
-    initial_train_log_likelihood_mean = float(-initial_train_ce_mean)
-    target_train_ce_mean = target_train_ce_mean_from_tau(
-        h_ml_train_ce_mean=h_ml_train_ce_mean,
-        tau=tau,
-    )
     history = {
         "train_cross_entropy": [],
         "train_cross_entropy_mean": [],
         "train_relative_likelihood": [],
         "tau": [float(tau)],
         "initial_train_cross_entropy_mean": [float(initial_train_ce_mean)],
-        "initial_train_log_likelihood_mean": [float(initial_train_log_likelihood_mean)],
-        "h_ml_train_cross_entropy_mean": [float(h_ml_train_ce_mean)],
-        "h_ml_train_log_likelihood_mean": [float(h_ml_train_log_likelihood_mean)],
-        "target_train_cross_entropy_mean": [float(target_train_ce_mean)],
     }
     start_epoch = 0
 
@@ -393,7 +358,7 @@ def train_crel_mean_member_model(
         checkpoint = torch.load(checkpoint_path, map_location=config.device, weights_only=False)
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
-        if checkpoint.get("scaler_state") is not None:
+        if use_amp:
             scaler.load_state_dict(checkpoint["scaler_state"])
         history = checkpoint["history"]
         start_epoch = checkpoint["completed_epochs"]
@@ -419,10 +384,7 @@ def train_crel_mean_member_model(
             device=config.device,
             use_amp=use_amp,
         )
-        final_relative_likelihood = relative_likelihood_from_mean_ce(
-            train_cross_entropy_mean=final_train_ce_mean,
-            h_ml_train_log_likelihood_mean=h_ml_train_log_likelihood_mean,
-        )
+        final_relative_likelihood = float(math.exp(h_ml_train_ce_mean - final_train_ce_mean))
         history["train_cross_entropy"].append(train_loss)
         history["train_cross_entropy_mean"].append(final_train_ce_mean)
         history["train_relative_likelihood"].append(final_relative_likelihood)
@@ -446,9 +408,6 @@ def train_crel_mean_member_model(
         model,
         history,
         stopped_epoch,
-        initial_train_ce_mean,
-        initial_train_log_likelihood_mean,
-        target_train_ce_mean,
         final_train_ce_mean,
         final_relative_likelihood,
     )
@@ -464,27 +423,15 @@ def train_or_load_h_ml(
     seed: int,
     checkpoint_dir: Path,
     normalization_stats: NormalizationStats,
-) -> tuple[nn.Module, dict[str, list[float]], float]:
+) -> float:
     summary_path = checkpoint_dir / "summary.json"
     model_path = checkpoint_dir / "model.pt"
     history_path = checkpoint_dir / "history.json"
 
-    if summary_path.exists() and model_path.exists() and history_path.exists():
-        model = ImageSoftClassifier(
-            encoder_name=config.encoder_name,
-            num_classes=num_classes,
-            pretrained=config.pretrained,
-            freeze_encoder=config.freeze_encoder,
-            classifier_dropout=config.classifier_dropout,
-        ).to(config.device)
-        state_dict = torch.load(model_path, map_location=config.device, weights_only=False)
-        model.load_state_dict(state_dict)
-        with history_path.open("r", encoding="utf-8") as handle:
-            history = json.load(handle)
+    if summary_path.exists():
         with summary_path.open("r", encoding="utf-8") as handle:
             summary = json.load(handle)
-        model.eval()
-        return model, history, float(summary["train_loss_sum"])
+        return float(summary["train_loss_sum"])
 
     model, history = train_single_model(
         train_records=train_records,
@@ -515,7 +462,35 @@ def train_or_load_h_ml(
         },
     )
     cleanup_training_state(checkpoint_dir)
-    return model, history, train_loss_sum
+    return train_loss_sum
+
+
+def evaluate_soft_ce(
+    *,
+    model: nn.Module,
+    loader: Any,
+    device: str,
+    use_amp: bool,
+) -> tuple[float, int]:
+    criterion = SoftTargetCrossEntropy()
+    model.eval()
+    total_loss = 0.0
+    total_items = 0
+    with torch.no_grad():
+        for images, targets, _ in loader:
+            images = images.to(device)
+            targets = targets.to(device)
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=use_amp,
+            ):
+                logits = model(images)
+                loss = criterion(logits, targets)
+            batch_size = images.shape[0]
+            total_loss += float(loss.item()) * batch_size
+            total_items += batch_size
+    return total_loss, total_items
 
 
 def evaluate_soft_ce_sum(
@@ -540,21 +515,12 @@ def evaluate_soft_ce_sum(
         num_workers=config.num_workers,
         pin_memory=config.device.startswith("cuda"),
     )
-    criterion = SoftTargetCrossEntropy()
-    model.eval()
-    total_loss = 0.0
-    with torch.no_grad():
-        for images, targets, _ in loader:
-            images = images.to(config.device)
-            targets = targets.to(config.device)
-            with torch.autocast(
-                device_type="cuda",
-                dtype=torch.float16,
-                enabled=config.amp and config.device.startswith("cuda"),
-            ):
-                logits = model(images)
-                loss = criterion(logits, targets)
-            total_loss += float(loss.item()) * images.shape[0]
+    total_loss, _ = evaluate_soft_ce(
+        model=model,
+        loader=loader,
+        device=config.device,
+        use_amp=config.amp and config.device.startswith("cuda"),
+    )
     return total_loss
 
 
@@ -565,39 +531,13 @@ def evaluate_soft_ce_mean_from_loader(
     device: str,
     use_amp: bool,
 ) -> float:
-    criterion = SoftTargetCrossEntropy()
-    model.eval()
-    total_loss = 0.0
-    total_items = 0
-    with torch.no_grad():
-        for images, targets, _ in loader:
-            images = images.to(device)
-            targets = targets.to(device)
-            with torch.autocast(
-                device_type="cuda",
-                dtype=torch.float16,
-                enabled=use_amp,
-            ):
-                logits = model(images)
-                loss = criterion(logits, targets)
-            batch_size = images.shape[0]
-            total_loss += float(loss.item()) * batch_size
-            total_items += batch_size
-    return float(total_loss / max(total_items, 1))
-
-
-def target_train_ce_mean_from_tau(*, h_ml_train_ce_mean: float, tau: float) -> float:
-    safe_tau = max(float(tau), 1e-12)
-    return float(h_ml_train_ce_mean - math.log(safe_tau))
-
-
-def relative_likelihood_from_mean_ce(
-    *,
-    train_cross_entropy_mean: float,
-    h_ml_train_log_likelihood_mean: float,
-) -> float:
-    train_log_likelihood_mean = -float(train_cross_entropy_mean)
-    return float(math.exp(train_log_likelihood_mean - h_ml_train_log_likelihood_mean))
+    total_loss, total_items = evaluate_soft_ce(
+        model=model,
+        loader=loader,
+        device=device,
+        use_amp=use_amp,
+    )
+    return total_loss / total_items
 
 
 def to_standard_config(config: CreRLMeanImageExperimentConfig) -> ImageExperimentConfig:
