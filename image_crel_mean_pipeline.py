@@ -45,7 +45,7 @@ from image_pipeline import (
 
 
 @dataclass(slots=True)
-class CreRLImageExperimentConfig:
+class CreRLMeanImageExperimentConfig:
     data_root: Path = Path("data/image")
     output_root: Path = Path("out/image")
     encoder_name: str = "resnet18"
@@ -70,9 +70,34 @@ class CreRLImageExperimentConfig:
     tobias_strength: float = 100.0
 
 
+def apply_tobias_initialization(
+    *,
+    model: ImageSoftClassifier,
+    num_classes: int,
+    member_index: int,
+    tobias_strength: float,
+) -> None:
+    head = model.head
+    final_linear: nn.Linear
+    if isinstance(head, nn.Sequential):
+        final_linear = head[-1]
+    elif isinstance(head, nn.Linear):
+        final_linear = head
+    else:
+        raise TypeError(f"Unsupported head type for ToBias: {type(head)!r}")
+
+    target_class = member_index % num_classes
+    with torch.no_grad():
+        final_linear.bias[target_class] = tobias_strength
+
+def build_tau_schedule(*, alpha: float, ensemble_size: int) -> list[float]:
+    if ensemble_size <= 1:
+        return [1.0]
+    return [float(value) for value in np.linspace(alpha, 1.0, num=ensemble_size)]
+
 def run_dataset_experiment(
     dataset_name: str,
-    config: CreRLImageExperimentConfig,
+    config: CreRLMeanImageExperimentConfig,
 ) -> DatasetResult:
     output_dir = config.output_root / dataset_name / config.encoder_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +136,7 @@ def run_dataset_experiment(
 
         h_ml_dir = fold_dir / "h_ml"
         h_ml_dir.mkdir(parents=True, exist_ok=True)
-        h_ml_model, h_ml_history, h_ml_train_loss_sum = train_or_load_h_ml(
+        _, _, h_ml_train_loss_sum = train_or_load_h_ml(
             dataset_name=dataset_name,
             train_records=train_records,
             val_records=val_records,
@@ -121,6 +146,8 @@ def run_dataset_experiment(
             checkpoint_dir=h_ml_dir,
             normalization_stats=normalization_stats,
         )
+        h_ml_train_ce_mean = float(h_ml_train_loss_sum / max(len(train_records), 1))
+        h_ml_train_log_likelihood_mean = float(-h_ml_train_ce_mean)
 
         tau_values = build_tau_schedule(
             alpha=config.alpha,
@@ -139,7 +166,16 @@ def run_dataset_experiment(
             member_summary = load_member_summary_if_complete(member_dir)
 
             if member_summary is None:
-                model, history, reached_epoch, final_train_loss_sum = train_crel_member_model(
+                (
+                    model,
+                    history,
+                    reached_epoch,
+                    initial_train_ce_mean,
+                    initial_train_log_likelihood_mean,
+                    target_train_ce_mean,
+                    final_train_ce_mean,
+                    final_relative_likelihood,
+                ) = train_crel_mean_member_model(
                     dataset_name=dataset_name,
                     train_records=train_records,
                     num_classes=len(class_names),
@@ -149,7 +185,8 @@ def run_dataset_experiment(
                     normalization_stats=normalization_stats,
                     member_index=member_index,
                     tau=tau,
-                    h_ml_train_loss_sum=h_ml_train_loss_sum,
+                    h_ml_train_ce_mean=h_ml_train_ce_mean,
+                    h_ml_train_log_likelihood_mean=h_ml_train_log_likelihood_mean,
                 )
                 probabilities, targets, image_paths = predict_records(
                     model=model,
@@ -179,9 +216,13 @@ def run_dataset_experiment(
                     "prediction_file": str(member_prediction_path),
                     "history_file": str(member_prediction_path.with_name("history.json")),
                     "tau": float(tau),
-                    "target_train_loss_sum": float(target_train_loss_sum_from_tau(h_ml_train_loss_sum, tau)),
-                    "final_train_loss_sum": float(final_train_loss_sum),
-                    "reached_threshold": bool(final_train_loss_sum <= target_train_loss_sum_from_tau(h_ml_train_loss_sum, tau)),
+                    "initial_train_cross_entropy_mean": float(initial_train_ce_mean),
+                    "initial_train_log_likelihood_mean": float(initial_train_log_likelihood_mean),
+                    "target_train_cross_entropy_mean": float(target_train_ce_mean),
+                    "h_ml_train_cross_entropy_mean": float(h_ml_train_ce_mean),
+                    "final_train_cross_entropy_mean": float(final_train_ce_mean),
+                    "final_relative_likelihood": float(final_relative_likelihood),
+                    "reached_threshold": bool(final_relative_likelihood >= float(tau)),
                     "stopped_epoch": reached_epoch,
                 }
                 write_json(member_dir / "summary.json", member_summary)
@@ -230,7 +271,8 @@ def run_dataset_experiment(
                 "model_file": str(fold_dir / "h_ml" / "model.pt"),
                 "history_file": str(fold_dir / "h_ml" / "history.json"),
                 "train_loss_sum": float(h_ml_train_loss_sum),
-                "train_loss_mean": float(h_ml_train_loss_sum / max(len(train_records), 1)),
+                "train_cross_entropy_mean": float(h_ml_train_ce_mean),
+                "train_log_likelihood_mean": float(h_ml_train_log_likelihood_mean),
                 "alpha": config.alpha,
                 "tau_values": [float(value) for value in tau_values],
                 "tobias_strength": config.tobias_strength,
@@ -254,13 +296,171 @@ def run_dataset_experiment(
     return result
 
 
+def train_crel_mean_member_model(
+    *,
+    dataset_name: str,
+    train_records: list[ImageRecord],
+    num_classes: int,
+    config: CreRLMeanImageExperimentConfig,
+    seed: int,
+    checkpoint_dir: Path,
+    normalization_stats: NormalizationStats,
+    member_index: int,
+    tau: float,
+    h_ml_train_ce_mean: float,
+    h_ml_train_log_likelihood_mean: float,
+) -> tuple[nn.Module, dict[str, list[float]], int, float, float, float, float, float]:
+    set_seed(seed)
+    standard_config = to_standard_config(config)
+    train_loader = make_dataloader(
+        data_root=config.data_root,
+        records=train_records,
+        transform=build_transform(
+            standard_config,
+            dataset_name=dataset_name,
+            train=True,
+            normalization_stats=normalization_stats,
+        ),
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=config.device.startswith("cuda"),
+    )
+    eval_train_loader = make_dataloader(
+        data_root=config.data_root,
+        records=train_records,
+        transform=build_transform(
+            standard_config,
+            dataset_name=dataset_name,
+            train=False,
+            normalization_stats=normalization_stats,
+        ),
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=config.device.startswith("cuda"),
+    )
+
+    model = ImageSoftClassifier(
+        encoder_name=config.encoder_name,
+        num_classes=num_classes,
+        pretrained=config.pretrained,
+        freeze_encoder=config.freeze_encoder,
+        classifier_dropout=config.classifier_dropout,
+    ).to(config.device)
+    apply_tobias_initialization(
+        model=model,
+        num_classes=num_classes,
+        member_index=member_index,
+        tobias_strength=config.tobias_strength,
+    )
+
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    criterion = SoftTargetCrossEntropy()
+    use_amp = config.amp and config.device.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    checkpoint_path = checkpoint_dir / "training_state.pt"
+
+    initial_train_ce_mean = evaluate_soft_ce_mean_from_loader(
+        model=model,
+        loader=eval_train_loader,
+        device=config.device,
+        use_amp=use_amp,
+    )
+    initial_train_log_likelihood_mean = float(-initial_train_ce_mean)
+    target_train_ce_mean = target_train_ce_mean_from_tau(
+        h_ml_train_ce_mean=h_ml_train_ce_mean,
+        tau=tau,
+    )
+    history = {
+        "train_cross_entropy": [],
+        "train_cross_entropy_mean": [],
+        "train_relative_likelihood": [],
+        "tau": [float(tau)],
+        "initial_train_cross_entropy_mean": [float(initial_train_ce_mean)],
+        "initial_train_log_likelihood_mean": [float(initial_train_log_likelihood_mean)],
+        "h_ml_train_cross_entropy_mean": [float(h_ml_train_ce_mean)],
+        "h_ml_train_log_likelihood_mean": [float(h_ml_train_log_likelihood_mean)],
+        "target_train_cross_entropy_mean": [float(target_train_ce_mean)],
+    }
+    start_epoch = 0
+
+    if checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, map_location=config.device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        if checkpoint.get("scaler_state") is not None:
+            scaler.load_state_dict(checkpoint["scaler_state"])
+        history = checkpoint["history"]
+        start_epoch = checkpoint["completed_epochs"]
+        restore_rng_state(checkpoint["rng_state"])
+
+    final_train_ce_mean = math.inf
+    final_relative_likelihood = 0.0
+    stopped_epoch = start_epoch
+    for epoch_index in range(start_epoch, config.epochs):
+        train_loss = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            config.device,
+            optimizer,
+            scaler=scaler,
+            use_amp=use_amp,
+            epoch_index=epoch_index,
+        )
+        final_train_ce_mean = evaluate_soft_ce_mean_from_loader(
+            model=model,
+            loader=eval_train_loader,
+            device=config.device,
+            use_amp=use_amp,
+        )
+        final_relative_likelihood = relative_likelihood_from_mean_ce(
+            train_cross_entropy_mean=final_train_ce_mean,
+            h_ml_train_log_likelihood_mean=h_ml_train_log_likelihood_mean,
+        )
+        history["train_cross_entropy"].append(train_loss)
+        history["train_cross_entropy_mean"].append(final_train_ce_mean)
+        history["train_relative_likelihood"].append(final_relative_likelihood)
+        stopped_epoch = epoch_index + 1
+        atomic_torch_save(
+            {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scaler_state": scaler.state_dict() if use_amp else None,
+                "history": history,
+                "completed_epochs": stopped_epoch,
+                "rng_state": capture_rng_state(),
+            },
+            checkpoint_path,
+        )
+        if final_relative_likelihood >= float(tau):
+            break
+
+    model.eval()
+    return (
+        model,
+        history,
+        stopped_epoch,
+        initial_train_ce_mean,
+        initial_train_log_likelihood_mean,
+        target_train_ce_mean,
+        final_train_ce_mean,
+        final_relative_likelihood,
+    )
+
+
 def train_or_load_h_ml(
     *,
     dataset_name: str,
     train_records: list[ImageRecord],
     val_records: list[ImageRecord],
     num_classes: int,
-    config: CreRLImageExperimentConfig,
+    config: CreRLMeanImageExperimentConfig,
     seed: int,
     checkpoint_dir: Path,
     normalization_stats: NormalizationStats,
@@ -318,139 +518,12 @@ def train_or_load_h_ml(
     return model, history, train_loss_sum
 
 
-def train_crel_member_model(
-    *,
-    dataset_name: str,
-    train_records: list[ImageRecord],
-    num_classes: int,
-    config: CreRLImageExperimentConfig,
-    seed: int,
-    checkpoint_dir: Path,
-    normalization_stats: NormalizationStats,
-    member_index: int,
-    tau: float,
-    h_ml_train_loss_sum: float,
-) -> tuple[nn.Module, dict[str, list[float]], int, float]:
-    set_seed(seed)
-    standard_config = to_standard_config(config)
-    train_loader = make_dataloader(
-        data_root=config.data_root,
-        records=train_records,
-        transform=build_transform(
-            standard_config,
-            dataset_name=dataset_name,
-            train=True,
-            normalization_stats=normalization_stats,
-        ),
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=config.device.startswith("cuda"),
-    )
-    eval_train_loader = make_dataloader(
-        data_root=config.data_root,
-        records=train_records,
-        transform=build_transform(
-            standard_config,
-            dataset_name=dataset_name,
-            train=False,
-            normalization_stats=normalization_stats,
-        ),
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=config.device.startswith("cuda"),
-    )
-
-    model = ImageSoftClassifier(
-        encoder_name=config.encoder_name,
-        num_classes=num_classes,
-        pretrained=config.pretrained,
-        freeze_encoder=config.freeze_encoder,
-        classifier_dropout=config.classifier_dropout,
-    ).to(config.device)
-    apply_tobias_initialization(
-        model=model,
-        num_classes=num_classes,
-        member_index=member_index,
-        tobias_strength=config.tobias_strength,
-    )
-
-    optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
-    criterion = SoftTargetCrossEntropy()
-    use_amp = config.amp and config.device.startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    target_train_loss_sum = target_train_loss_sum_from_tau(h_ml_train_loss_sum, tau)
-    checkpoint_path = checkpoint_dir / "training_state.pt"
-
-    history = {
-        "train_cross_entropy": [],
-        "train_loss_sum": [],
-        "tau": [float(tau)],
-        "target_train_loss_sum": [float(target_train_loss_sum)],
-    }
-    start_epoch = 0
-
-    if checkpoint_path.exists():
-        checkpoint = torch.load(checkpoint_path, map_location=config.device, weights_only=False)
-        model.load_state_dict(checkpoint["model_state"])
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
-        if checkpoint.get("scaler_state") is not None:
-            scaler.load_state_dict(checkpoint["scaler_state"])
-        history = checkpoint["history"]
-        start_epoch = checkpoint["completed_epochs"]
-        restore_rng_state(checkpoint["rng_state"])
-
-    final_train_loss_sum = math.inf
-    stopped_epoch = start_epoch
-    for epoch_index in range(start_epoch, config.epochs):
-        train_loss = run_epoch(
-            model,
-            train_loader,
-            criterion,
-            config.device,
-            optimizer,
-            scaler=scaler,
-            use_amp=use_amp,
-            epoch_index=epoch_index,
-        )
-        final_train_loss_sum = evaluate_soft_ce_sum_from_loader(
-            model=model,
-            loader=eval_train_loader,
-            device=config.device,
-            use_amp=use_amp,
-        )
-        history["train_cross_entropy"].append(train_loss)
-        history["train_loss_sum"].append(final_train_loss_sum)
-        stopped_epoch = epoch_index + 1
-        atomic_torch_save(
-            {
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "scaler_state": scaler.state_dict() if use_amp else None,
-                "history": history,
-                "completed_epochs": stopped_epoch,
-                "rng_state": capture_rng_state(),
-            },
-            checkpoint_path,
-        )
-        if final_train_loss_sum <= target_train_loss_sum:
-            break
-
-    model.eval()
-    return model, history, stopped_epoch, final_train_loss_sum
-
-
 def evaluate_soft_ce_sum(
     *,
     model: nn.Module,
     records: list[ImageRecord],
     dataset_name: str,
-    config: CreRLImageExperimentConfig,
+    config: CreRLMeanImageExperimentConfig,
     normalization_stats: NormalizationStats,
 ) -> float:
     loader = make_dataloader(
@@ -467,15 +540,25 @@ def evaluate_soft_ce_sum(
         num_workers=config.num_workers,
         pin_memory=config.device.startswith("cuda"),
     )
-    return evaluate_soft_ce_sum_from_loader(
-        model=model,
-        loader=loader,
-        device=config.device,
-        use_amp=config.amp and config.device.startswith("cuda"),
-    )
+    criterion = SoftTargetCrossEntropy()
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for images, targets, _ in loader:
+            images = images.to(config.device)
+            targets = targets.to(config.device)
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=config.amp and config.device.startswith("cuda"),
+            ):
+                logits = model(images)
+                loss = criterion(logits, targets)
+            total_loss += float(loss.item()) * images.shape[0]
+    return total_loss
 
 
-def evaluate_soft_ce_sum_from_loader(
+def evaluate_soft_ce_mean_from_loader(
     *,
     model: nn.Module,
     loader: Any,
@@ -500,42 +583,24 @@ def evaluate_soft_ce_sum_from_loader(
             batch_size = images.shape[0]
             total_loss += float(loss.item()) * batch_size
             total_items += batch_size
-    return total_loss
+    return float(total_loss / max(total_items, 1))
 
 
-def apply_tobias_initialization(
-    *,
-    model: ImageSoftClassifier,
-    num_classes: int,
-    member_index: int,
-    tobias_strength: float,
-) -> None:
-    head = model.head
-    final_linear: nn.Linear
-    if isinstance(head, nn.Sequential):
-        final_linear = head[-1]
-    elif isinstance(head, nn.Linear):
-        final_linear = head
-    else:
-        raise TypeError(f"Unsupported head type for ToBias: {type(head)!r}")
-
-    target_class = member_index % num_classes
-    with torch.no_grad():
-        final_linear.bias[target_class] = tobias_strength
-
-
-def build_tau_schedule(*, alpha: float, ensemble_size: int) -> list[float]:
-    if ensemble_size <= 1:
-        return [1.0]
-    return [float(value) for value in np.linspace(alpha, 1.0, num=ensemble_size)]
-
-
-def target_train_loss_sum_from_tau(h_ml_train_loss_sum: float, tau: float) -> float:
+def target_train_ce_mean_from_tau(*, h_ml_train_ce_mean: float, tau: float) -> float:
     safe_tau = max(float(tau), 1e-12)
-    return float(h_ml_train_loss_sum - math.log(safe_tau))
+    return float(h_ml_train_ce_mean - math.log(safe_tau))
 
 
-def to_standard_config(config: CreRLImageExperimentConfig) -> ImageExperimentConfig:
+def relative_likelihood_from_mean_ce(
+    *,
+    train_cross_entropy_mean: float,
+    h_ml_train_log_likelihood_mean: float,
+) -> float:
+    train_log_likelihood_mean = -float(train_cross_entropy_mean)
+    return float(math.exp(train_log_likelihood_mean - h_ml_train_log_likelihood_mean))
+
+
+def to_standard_config(config: CreRLMeanImageExperimentConfig) -> ImageExperimentConfig:
     return ImageExperimentConfig(
         data_root=config.data_root,
         output_root=config.output_root,
@@ -560,7 +625,7 @@ def to_standard_config(config: CreRLImageExperimentConfig) -> ImageExperimentCon
     )
 
 
-def serialize_config(config: CreRLImageExperimentConfig) -> dict[str, Any]:
+def serialize_config(config: CreRLMeanImageExperimentConfig) -> dict[str, Any]:
     return {
         "method": "crel",
         "data_root": str(config.data_root),
@@ -588,7 +653,7 @@ def serialize_config(config: CreRLImageExperimentConfig) -> dict[str, Any]:
     }
 
 
-def build_run_name(config: CreRLImageExperimentConfig) -> str:
+def build_run_name(config: CreRLMeanImageExperimentConfig) -> str:
     mode = "finetune" if not config.freeze_encoder else "head-only"
     pretrained = "pretrained" if config.pretrained else "scratch"
     fold_part = "all-folds" if not config.folds else "-".join(sorted(config.folds))
@@ -621,7 +686,7 @@ def build_run_name(config: CreRLImageExperimentConfig) -> str:
     return f"{sanitize_path_token(readable)}_{fingerprint}"
 
 
-def serialize_config_for_run_name(config: CreRLImageExperimentConfig) -> dict[str, Any]:
+def serialize_config_for_run_name(config: CreRLMeanImageExperimentConfig) -> dict[str, Any]:
     payload = serialize_config(config)
     if config.normalization == "imagenet":
         payload.pop("normalization", None)
@@ -631,7 +696,7 @@ def serialize_config_for_run_name(config: CreRLImageExperimentConfig) -> dict[st
 
 
 def serialize_for_run(
-    config: CreRLImageExperimentConfig,
+    config: CreRLMeanImageExperimentConfig,
     dataset_names: list[str],
 ) -> dict[str, Any]:
     return {
@@ -641,7 +706,7 @@ def serialize_for_run(
 
 
 __all__ = [
-    "CreRLImageExperimentConfig",
+    "CreRLMeanImageExperimentConfig",
     "build_run_name",
     "run_dataset_experiment",
     "save_results_summary",

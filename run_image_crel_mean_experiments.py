@@ -4,9 +4,10 @@ import argparse
 from pathlib import Path
 
 import torch
+
 from image_augmentations import AUGMENTATION_MODES
-from image_crel_pipeline import (
-    CreRLImageExperimentConfig,
+from image_crel_mean_pipeline import (
+    CreRLMeanImageExperimentConfig,
     build_run_name,
     run_dataset_experiment,
     save_results_summary,
@@ -18,13 +19,13 @@ from image_pipeline import discover_image_datasets, list_available_encoders
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train relative-likelihood image ensembles with explicit h_ml and ToBias initialization."
+        description="Train CreRL image ensembles with mean train CE / mean relative-likelihood early stopping."
     )
     parser.add_argument(
         "--dataset",
         action="append",
         dest="datasets",
-        help="Dataset name under data/image/. Repeat to run multiple datasets. Defaults to all datasets.",
+        help="Dataset name under data/image/. Defaults to all datasets.",
     )
     parser.add_argument(
         "--encoder",
@@ -43,8 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument(
         "--device",
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Explicit device, for example cpu, cuda, or cuda:0.",
+        default="cuda" if torch.cuda.is_available() else  "mps" if torch.backends.mps.is_available() else "cpu",
     )
     parser.add_argument("--alpha", type=float, default=0.8)
     parser.add_argument("--tobias-strength", type=float, default=100.0)
@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--fold",
         action="append",
         dest="folds",
-        help="Held-out test fold to evaluate, for example fold1. Repeat to run multiple folds.",
+        help="Held-out test fold for evaluation, for example fold1.",
     )
     parser.add_argument(
         "--output-root",
@@ -91,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dropout",
         type=float,
         default=0.0,
-        help="Optional dropout applied in the classifier head.",
+        help="Dropout applied in the classifier head.",
     )
     parser.add_argument(
         "--amp",
@@ -107,7 +107,7 @@ def main() -> None:
     args = parser.parse_args()
 
     dataset_names = args.datasets or discover_image_datasets(args.data_root)
-    base_config = CreRLImageExperimentConfig(
+    base_config = CreRLMeanImageExperimentConfig(
         data_root=args.data_root,
         output_root=args.output_root,
         encoder_name=args.encoder,
@@ -133,7 +133,7 @@ def main() -> None:
     )
     run_name = build_run_name(base_config)
     run_output_root = args.output_root / run_name
-    config = CreRLImageExperimentConfig(
+    config = CreRLMeanImageExperimentConfig(
         data_root=base_config.data_root,
         output_root=run_output_root,
         encoder_name=base_config.encoder_name,
