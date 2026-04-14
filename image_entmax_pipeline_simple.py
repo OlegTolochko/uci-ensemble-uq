@@ -65,20 +65,6 @@ class FoldResult:
             "model_files": self.model_files,
         }
 
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "FoldResult":
-        return cls(
-            test_fold=payload["test_fold"],
-            train_size=int(payload["train_size"]),
-            val_size=int(payload["val_size"]),
-            test_size=int(payload["test_size"]),
-            member_cross_entropies=[float(value) for value in payload["member_cross_entropies"]],
-            ensemble_cross_entropy=float(payload["ensemble_cross_entropy"]),
-            prediction_file=payload["prediction_file"],
-            member_prediction_files=list(payload["member_prediction_files"]),
-            model_files=list(payload["model_files"]),
-        )
-
 
 @dataclass(slots=True)
 class DatasetResult:
@@ -101,40 +87,28 @@ class DatasetResult:
             "config": self.config,
         }
 
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "DatasetResult":
-        return cls(
-            dataset_name=payload["dataset_name"],
-            encoder_name=payload["encoder_name"],
-            class_names=list(payload["class_names"]),
-            folds=[FoldResult.from_dict(item) for item in payload["folds"]],
-            mean_member_cross_entropy=float(payload["mean_member_cross_entropy"]),
-            mean_ensemble_cross_entropy=float(payload["mean_ensemble_cross_entropy"]),
-            config=dict(payload["config"]),
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class EntmaxImageExperimentConfig:
     data_root: Path
     output_root: Path
     encoder_name: str
-    pretrained: bool = True
-    freeze_encoder: bool = True
-    ensemble_size: int = 5
-    batch_size: int = 32
-    epochs: int = 20
-    learning_rate: float = 1e-3
-    weight_decay: float = 1e-4
-    validation_size: float = 0.1
-    early_stopping_patience: int = 4
-    num_workers: int = 4
-    device: str = "cpu"
-    seed: int = 42
-    test_fold: str = "fold1"
-    augmentation: str = "basic"
-    classifier_dropout: float = 0.0
-    entmax_alpha: float = 1.5
+    pretrained: bool
+    freeze_encoder: bool
+    ensemble_size: int
+    batch_size: int
+    epochs: int
+    learning_rate: float
+    weight_decay: float
+    validation_size: float
+    early_stopping_patience: int
+    num_workers: int
+    device: str
+    seed: int
+    test_fold: str
+    augmentation: str
+    classifier_dropout: float
+    entmax_alpha: float
 
 
 class SoftLabelImageDataset(Dataset):
@@ -169,12 +143,15 @@ class SoftTargetEntmaxBisectLoss(nn.Module):
             logits,
             alpha=self.alpha,
             dim=1,
-            n_iter=self.n_iter,
-            ensure_sum_one=True,
+            n_iter=self.n_iter, # number iterations to solve for entmax normalization threshold
         )
+        # The loss is derived from the Fenchel-Young loss formulation for entmax.
+        # This is necessary since Entmax uses a different mapping from logits to probabilities, 
+        # so it has a different matched loss.
+        # This is equivalent to the standard cross-entropy loss when alpha=1 (softmax)
         omega = (1 - (probabilities**self.alpha).sum(dim=1)) / (
             self.alpha * (self.alpha - 1)
-        )
+        ) # Tsallis entropy, acts as regularization to prevent solution becoming too sharp too early, rewards distributions with larger entropy
         return (omega + ((probabilities - targets) * logits).sum(dim=1)).mean()
 
 
@@ -210,8 +187,6 @@ class ImageEntmaxClassifier(nn.Module):
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         features = self.encoder(images)
-        if features.ndim > 2:
-            features = torch.flatten(features, start_dim=1)
         return self.head(features)
 
 
@@ -266,7 +241,7 @@ def list_image_datasets(data_root: Path) -> list[str]:
     return sorted(path.name for path in data_root.iterdir() if path.is_dir())
 
 
-def serialize_config(config: EntmaxImageExperimentConfig) -> dict[str, Any]:
+def config_to_dict(config: EntmaxImageExperimentConfig) -> dict[str, Any]:
     return {
         "data_root": str(config.data_root),
         "output_root": str(config.output_root),
@@ -288,13 +263,6 @@ def serialize_config(config: EntmaxImageExperimentConfig) -> dict[str, Any]:
         "classifier_dropout": config.classifier_dropout,
         "entmax_alpha": config.entmax_alpha,
     }
-
-
-def serialize_for_run(
-    config: EntmaxImageExperimentConfig,
-    datasets: list[str],
-) -> dict[str, Any]:
-    return {"datasets": datasets, "config": serialize_config(config)}
 
 
 def sanitize_path_token(value: str) -> str:
@@ -330,7 +298,7 @@ def build_run_name(config: EntmaxImageExperimentConfig) -> str:
 
 def extract_fold_name(image_path: str) -> str:
     parts = Path(image_path).parts
-    return parts[1] if len(parts) > 1 else "fold0"
+    return parts[1] if len(parts) > 1 else "unknown_fold"
 
 
 def load_image_dataset(dataset_dir: Path) -> tuple[list[str], list[ImageRecord]]:
@@ -355,8 +323,8 @@ def load_image_dataset(dataset_dir: Path) -> tuple[list[str], list[ImageRecord]]
         total_votes = sum(class_counts.values())
         target_probs = np.array(
             [
-                class_counts.get(class_name, 0) / total_votes
-                for class_name in ordered_classes
+                class_counts.get(class_name, 0) / total_votes 
+                for class_name in ordered_classes # checks class_counts for each possible class
             ],
             dtype=np.float32,
         )
@@ -376,42 +344,11 @@ def split_train_validation_records(
     validation_size: float,
     seed: int,
 ) -> tuple[list[ImageRecord], list[ImageRecord]]:
-    if not records:
-        raise ValueError("Training set is empty after removing the test fold.")
-    if not 0 < validation_size < 1:
-        raise ValueError("validation_size must be between 0 and 1.")
-    if len(records) == 1:
-        raise ValueError("Need at least two training records to create a validation split.")
-
     rng = np.random.default_rng(seed)
-    indices_by_label: dict[int, list[int]] = defaultdict(list)
-    for index, record in enumerate(records):
-        indices_by_label[int(np.argmax(record.target_probs))].append(index)
-
-    val_indices: list[int] = []
-    for indices in indices_by_label.values():
-        shuffled = indices.copy()
-        rng.shuffle(shuffled)
-        if len(shuffled) == 1:
-            continue
-        val_count = int(round(len(shuffled) * validation_size))
-        val_count = max(1, val_count)
-        val_count = min(val_count, len(shuffled) - 1)
-        val_indices.extend(shuffled[:val_count])
-
-    if not val_indices:
-        shuffled = np.arange(len(records))
-        rng.shuffle(shuffled)
-        val_indices = [int(shuffled[0])]
-
-    val_index_set = set(val_indices)
-    train_records = [record for index, record in enumerate(records) if index not in val_index_set]
-    val_records = [record for index, record in enumerate(records) if index in val_index_set]
-
-    if not train_records or not val_records:
-        raise ValueError("Could not create a non-empty train/validation split.")
-
-    return train_records, val_records
+    shuffled_indices = rng.permutation(len(records))
+    split_index = int(len(records) * (1 - validation_size))
+    shuffled_records = [records[index] for index in shuffled_indices]
+    return shuffled_records[:split_index], shuffled_records[split_index:]
 
 
 def build_transform(
@@ -458,13 +395,13 @@ def cross_entropy_per_sample(
     targets: np.ndarray,
     probabilities: np.ndarray,
 ) -> np.ndarray:
-    clipped = np.clip(np.asarray(probabilities, dtype=np.float64), 1e-8, 1.0)
+    clipped = np.clip(np.asarray(probabilities, dtype=np.float64), 1e-8, 1.0) # Prevent log(0)
     safe_targets = np.asarray(targets, dtype=np.float64)
     return -(safe_targets * np.log(clipped)).sum(axis=1)
 
 
 def entropy_per_sample(distributions: np.ndarray) -> np.ndarray:
-    clipped = np.clip(np.asarray(distributions, dtype=np.float64), 1e-8, 1.0)
+    clipped = np.clip(np.asarray(distributions, dtype=np.float64), 1e-8, 1.0) # Prevent log(0)
     return -(clipped * np.log(clipped)).sum(axis=1)
 
 
@@ -575,7 +512,7 @@ def train_single_model(
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
-        pin_memory=config.device.startswith("cuda"),
+        pin_memory=config.device.startswith("cuda"), # small optimization, can speed up data transfer to GPU
     )
     val_loader = make_dataloader(
         data_root=config.data_root,
@@ -588,7 +525,7 @@ def train_single_model(
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
-        pin_memory=config.device.startswith("cuda"),
+        pin_memory=config.device.startswith("cuda"), # small optimization, can speed up data transfer to GPU
     )
 
     model = ImageEntmaxClassifier(
@@ -817,9 +754,9 @@ def run_dataset_experiment(
         folds=[fold_result],
         mean_member_cross_entropy=float(np.mean(member_losses)),
         mean_ensemble_cross_entropy=ensemble_loss,
-        config=serialize_config(config),
+        config=config_to_dict(config),
     )
 
-    write_json(output_dir / "config.json", serialize_config(config))
+    write_json(output_dir / "config.json", config_to_dict(config))
     write_json(output_dir / "summary.json", result.to_dict())
     return result
