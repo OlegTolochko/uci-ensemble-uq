@@ -19,36 +19,75 @@
 
 Image datasets should be stored under [data/image](data/image). Used datasets can be downloaded here: https://zenodo.org/records/8115942
 
-### Pipeline Overview
+### Entmax Image Pipeline
 
-- loads annotator votes from each dataset `annotations.json`
-- creates per-image target probability distributions from annotator votes
-- test data is a held-out fold (each dataset is already split into 5 separate folds), remaining folds are used for training
-- trains a classifier (basically any image classifier can be chosen that is supported via torchvision) with soft-target cross entropy
-- exports per-image predicted distributions for later uncertainty analysis
+- Main runner: [run_image_entmax_simple.py](run_image_entmax_simple.py)
+- Main pipeline: [image_entmax_pipeline_simple.py](image_entmax_pipeline_simple.py)
+- Results helper: [image_results.py](image_results.py)
+
+### Supported args
+
+| Argument            |                                            Default value | Description                                                                                                    |
+| ------------------- | -------------------------------------------------------: | -------------------------------------------------------------------------------------------------------------- |
+| `--dataset`         |                                                   `None` | if not set, all datasets found in `data_root` are used, can be passed multiple times                           |
+| `--encoder`         |                                               `resnet18` | which torchvision encoder to use (e.g. also resnet50, check DEFAULT_ENCODERS in main pipeline for all options) |
+| `--ensemble-size`   |                                                     `25` | number of independently initialized models trained on the same split                                           |
+| `--epochs`          |                                                     `20` | number of training epochs                                                                                      |
+| `--batch-size`      |                                                     `32` | batch size used for train, validation and test dataloaders                                                     |
+| `--lr`              |                                                   `1e-3` | learning rate for AdamW                                                                                        |
+| `--weight-decay`    |                                                   `1e-4` | weight decay for AdamW                                                                                         |
+| `--validation-size` |                                                    `0.1` | fraction of the non-test data used as validation set                                                           |
+| `--patience`        |                                                      `4` | number of epochs with no improvement on val set after which training is stopped                                |
+| `--seed`            |                                                     `42` | random seed used for splitting and model initialization                                                        |
+| `--workers`         |                                                      `4` | number of dataloader worker processes                                                                          |
+| `--device`          | `cuda` if available, else `mps` if available, else `cpu` | which device to run training and inference on                                                                  |
+| `--finetune`        |                                                  `False` | if not set, encoder is frozen and only classification head is trained                                          |
+| `--no-pretrained`   |                                                  `False` | if set, encoder is initialized with random weights instead of imagenet pretrained weights                      |
+| `--test-fold`       |                                                  `fold1` | which fold to use as test set, options are: `fold1`, `fold2`, `fold3`, `fold4`, `fold5`                        |
+| `--output-root`     |                                              `out/image` | root directory where run outputs are written                                                                   |
+| `--data-root`       |                                             `data/image` | root directory containing the image datasets                                                                   |
+| `--augmentation`    |                                                  `basic` | basic is currently just `RandomHorizontalFlip`                                                                 |
+| `--dropout`         |                                                    `0.0` | dropout rate for classification head, applied after global average pooling and before linear layer             |
+| `--entmax-alpha`    |                                                    `1.5` | alpha parameter for entmax, controls sparsity output logits, alpha=1 is softmax, alpha=2 is sparsemax          |
+
+### Full Pipeline
+
+run_image_entmax_simple:
+1. Initialize Argument Parser
+2. Construct config from passed arguments
+3. Create run directory and write config to .json
+4. For each dataset run: run_dataset_experiment(dataset_name, config)
+5. Save run result summary for each dataset
 
 
-### Detailed Pipeline Overview
-<details>
-<summary>Expand for Detailed Pipeline</summary>
-
-- Initialize Config for running experimenets (run_image_experiments.py)
-- For each dataset given (default is all datasets) run experiment pipeline (run_dataset_experiment), default trains 5 models, one per test fold, --fold fold1 would only use the first fold for testing
-- load class_names + dataset records (load_image_dataset)
+image_entmax_pipeline_simple, run_dataset_experiment:
+1. load class_names + dataset records (load_image_dataset)
 	- Each dataset has an annotations.json, which links an image path to its vote counts, structure: {"record_n": {"annotations": {"image_path": ..., "class_label": ..., "created_at": ...}, ...}, ...}
 	- For each annotation get image path + class label, count number of times a class was voted for a given image path
+	- class_counts is a dict (associated with an image_path) that contains a mapping from class_names with their respective counts e.g. {"car": 1, "house": 7, "tree": 2}
 	- transform counts to probabilities, wrap each Image into a ImageRecord (stores image path, fold it was in and target distribution)
-- For each given fold put all records that much this specific fold in the test set, all others in the train set
-- Split train set into train and validation sets
-- For the set number of ensemble members, train a model (each with different seed)
-	1. create train and validation dataloader, with set batch_size and transformations (default normalization uses imagenet mean + std, since pretrained models were trained on imagenet, as well as resize to expected input image size). Additionally also RandomHorizontalFlip currently for the train set
-	2. Initialize Model, based on passed model name (e.g. resnet18, resnet50, vit_b_16, etc.), replace classification head with linear layer and optionally freeze all layers leading up to classification head (--finetune in config if weights should not be frozen)
-	3. Set up optimizer (adamW) + loss (soft target cross entropy)
-	4. Begin training loop for set amount of epochs, (run_epoch for both training set, where gradients are calculated and weights are updated; once for validation set, where no weights are updated)
-	5. If validation loss is higher than the best validation loss recorded yet for a set amount of epochs, stop training early and load best model state and save model
-- Test model performance (calculate mean cross entropy) on held out test old and save individual prediction results to a csv table
-- Save result summary for each dataset (summary.json) across all fold results
-</details>
+2. Put all records that match chosen test fold in the test set, all others in the train set
+3. Split train set into train and validation sets (additional shuffling of records given the seed, default split is 90/10)
+4. For each ensemble member index:
+	1. Construct own directory inside run directory
+	2. train member given set config:
+		1. Train single model:
+			1. Create train and validation dataloaders with a transform recipe built in build_transform (Image resize to encoder input and RandomHorizontalFlip)
+			2. Initialize model:
+				1. If pretrained model is utilized, imagenet weights are loaded for the specified model
+				2. replace old classification head with identity and get number of in features to classification head (replace_classification_head_with_identity)
+				3. Bulid new classification head, single Linear Layer with num_classes neurons and in_features weights + 1 weights per neuron (with optional dropout before linear layer)
+				4. if only classification head is supposed to be trained (so no --finetune flag was passed) encoder parameters are frozen
+			3. Initialize AdamW optimizer and Loss function (Fenchel-Young loss formulation, required since entmax uses different mapping from logits to probabilities)
+			4. for specified number of epochs:
+				1. Standard torch model training setup, update model weights
+				2. Then also run inference once for validation data
+				3. check if validation loss is smaller than previous best val loss, if so start counting up to early stopping threshold
+		2. run trained model on test data and compute predicted probability distributions with entmax
+		3. compute mean cross entropy loss for this member
+		4. save model, all predictions in .csv (image path, fold, cross_entropy, target_entropy + target and predicted probabilities for each class) and a small summary
+	3. compute mean ensemble-wise probability predictions and compute ensemble cross entropy
+	4. save results for fold + dataset, as well as a summary and the utilized config
 
 ### Supported encoders
 
@@ -58,51 +97,31 @@ Image datasets should be stored under [data/image](data/image). Used datasets ca
 - `convnext_tiny`
 - `vit_b_16`
 
-The implementation is in [image_pipeline.py](image_pipeline.py) and the CLI runner is [run_image_experiments.py](run_image_experiments.py).
-
-### Default training setup
-
-- pretrained ImageNet encoder
-- frozen encoder by default, with a learned classification head
-- soft-target cross entropy loss
-- fold-based evaluation using the existing `fold1` ... `fold5` directories
-- `--normalization imagenet` by default
-
-### Normalization modes
-
-- `imagenet`: use `(0.485, 0.456, 0.406)` and `(0.229, 0.224, 0.225)`
-- `dataset`: compute and cache one RGB mean/std pair per held-out fold and dataset, using all non-held-out folds. The cache is stored as `normalization_stats.json` inside each dataset directory.
-
-For backward compatibility, ImageNet normalization keeps the previous run naming scheme. Only non-ImageNet normalization adds a normalization tag to the run directory name.
-
 ### Example commands
 
 Run one dataset with a `resnet18` ensemble:
 
-    python run_image_experiments.py --dataset CIFAR10H --encoder resnet18 --ensemble-size 5
+    python run_image_entmax_simple.py --dataset CIFAR10H --encoder resnet18 --ensemble-size 5
 
 Fine-tune the full encoder instead of only the head:
 
-    python run_image_experiments.py --dataset Benthic --encoder convnext_tiny --ensemble-size 3 --finetune
+    python run_image_entmax_simple.py --dataset Benthic --encoder convnext_tiny --ensemble-size 3 --finetune
 
-Quick smoke test on a small subset:
+Run a single held-out fold:
 
-    python run_image_experiments.py --dataset CIFAR10H --encoder resnet18 --ensemble-size 1 --epochs 1 --max-train-samples 64 --max-test-samples 32 --workers 0
-
-Run with cached dataset-specific normalization:
-
-    python run_image_experiments.py --dataset Benthic --encoder resnet18 --normalization dataset
+    python run_image_entmax_simple.py --dataset CIFAR10H --encoder resnet18 --ensemble-size 5 --test-fold fold1
 
 ### Outputs
 
 Results are written under [out/image](out/image):
 
-- one folder per dataset and encoder
-- one subfolder per held-out fold
+- one run directory per executed configuration
+- one folder per dataset and encoder inside the run directory
+- one subfolder for the chosen held-out fold
 - `predictions.csv` for each ensemble member
 - `ensemble_predictions.csv` for the averaged ensemble probabilities
 - `summary.json` with fold metrics and mean cross entropy
-- top-level `results.json` summarizing all runs launched by the CLI
+- top-level `results.json` summarizing all datasets in the run
 
 Each exported prediction file contains:
 
@@ -112,6 +131,11 @@ Each exported prediction file contains:
 - predicted distribution for every class
 - per-sample cross entropy
 - target entropy
+
+`image_results.py` reads one run directory and provides:
+
+- `iter_dataset_rows(run_dir)` to iterate row by row over dataset results
+- `get_latex_table(run_dir)` to build a LaTeX table
 
 ## UCI Dataset Overview
 
