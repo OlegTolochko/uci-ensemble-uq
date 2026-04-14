@@ -4,6 +4,8 @@ import argparse
 from pathlib import Path
 
 import torch
+from image_augmentations import AUGMENTATION_MODES
+from image_loss_variants import PROB_REGULARIZERS
 
 from image_pipeline import (
     ImageExperimentConfig,
@@ -42,6 +44,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--prob-regularizer",
+        choices=PROB_REGULARIZERS,
+        default="none",
+        help="Optional probability-space penalty added to the soft-target CE.",
+    )
+    parser.add_argument(
+        "--prob-regularizer-weight",
+        type=float,
+        default=0.0,
+        help="Weight for the probability-space penalty.",
+    )
+    parser.add_argument(
+        "--entropy-bonus-weight",
+        type=float,
+        default=0.0,
+        help="Reward predictive entropy to discourage overconfident outputs.",
+    )
+    parser.add_argument(
+        "--lambda-reg",
+        type=float,
+        default=0.0,
+        help="Strength of the DARE regularizer. Disabled at 0.",
+    )
     parser.add_argument(
         "--dropout",
         type=float,
@@ -97,6 +123,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--augmentation",
+        default="basic",
+        choices=AUGMENTATION_MODES,
+        help=(
+            "Training-time augmentation policy. "
+            "'basic' keeps the current random horizontal flip baseline. "
+            "'dcic_auto' mirrors the dcic paper setup by disabling augmentation for "
+            "CIFAR10H and QualityMRI and using the fuller bundle elsewhere."
+        ),
+    )
+    parser.add_argument(
         "--amp",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -126,7 +163,12 @@ def serialize_for_run(config: ImageExperimentConfig, dataset_names: list[str]) -
             "seed": config.seed,
             "folds": config.folds,
             "normalization": config.normalization,
+            "augmentation": config.augmentation,
             "classifier_dropout": config.classifier_dropout,
+            "lambda_reg": config.lambda_reg,
+            "prob_regularizer": config.prob_regularizer,
+            "prob_regularizer_weight": config.prob_regularizer_weight,
+            "entropy_bonus_weight": config.entropy_bonus_weight,
             "amp": config.amp,
         },
     }
@@ -148,6 +190,10 @@ def main():
         epochs=args.epochs,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
+        prob_regularizer=args.prob_regularizer,
+        prob_regularizer_weight=args.prob_regularizer_weight,
+        entropy_bonus_weight=args.entropy_bonus_weight,
+        lambda_reg=args.lambda_reg,
         classifier_dropout=args.dropout,
         validation_size=args.validation_size,
         early_stopping_patience=args.patience,
@@ -156,6 +202,7 @@ def main():
         seed=args.seed,
         folds=args.folds,
         normalization=args.normalization,
+        augmentation=args.augmentation,
         amp=args.amp,
     )
     run_name = build_run_name(base_config)
@@ -171,6 +218,10 @@ def main():
         epochs=base_config.epochs,
         learning_rate=base_config.learning_rate,
         weight_decay=base_config.weight_decay,
+        prob_regularizer=base_config.prob_regularizer,
+        prob_regularizer_weight=base_config.prob_regularizer_weight,
+        entropy_bonus_weight=base_config.entropy_bonus_weight,
+        lambda_reg=base_config.lambda_reg,
         classifier_dropout=base_config.classifier_dropout,
         validation_size=base_config.validation_size,
         early_stopping_patience=base_config.early_stopping_patience,
@@ -179,6 +230,7 @@ def main():
         seed=base_config.seed,
         folds=base_config.folds,
         normalization=base_config.normalization,
+        augmentation=base_config.augmentation,
         amp=base_config.amp,
     )
     write_json(run_output_root / "config.json", serialize_for_run(config, dataset_names))

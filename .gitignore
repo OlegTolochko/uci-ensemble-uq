@@ -11,3 +11,7 @@ wheels/
 
 out/
 data/
+wandb/
+docs/
+scripts/
+legacy/

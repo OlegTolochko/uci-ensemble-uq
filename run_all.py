@@ -4,12 +4,12 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-from main import pipeline
+from uci_tabular_pipeline import pipeline
 
 results_file = "out/results.json"
 
 datasets = [
-    # ── 3 classes ──────────────────────────────────────────────────────────
+    # 3 class datasets
     {
         "name": "student-dropout",
         "path": "data/student-dropout/student-dropout.csv",
@@ -38,7 +38,7 @@ datasets = [
         "sep": ",",
         "header": None,
     },
-    # ── 4 classes ──────────────────────────────────────────────────────────
+    # 4 class datasets
     {
         "name": "wall-robot",
         "path": "data/wall-robot/wall-robot.csv",
@@ -46,7 +46,7 @@ datasets = [
         "sep": ",",
         "header": None,
     },
-    # ── 6 classes ──────────────────────────────────────────────────────────
+    # 6 class datasets
     {
         "name": "satellite",
         "path": "data/satellite/satellite.data",
@@ -62,7 +62,7 @@ datasets = [
         "header": None,
         "id_column": 0,
     },
-    # ── 7 classes ──────────────────────────────────────────────────────────
+    # 7 class datasets
     {
         "name": "segmentation",
         "path": "data/segmentation/segmentation.data",
@@ -70,7 +70,7 @@ datasets = [
         "sep": r"\s+",
         "header": None,
     },
-    # ── 10 classes ─────────────────────────────────────────────────────────
+    # 10 class datasets
     {
         "name": "mfeat-factors",
         "path": "data/mfeat-factors/mfeat-factors.csv",

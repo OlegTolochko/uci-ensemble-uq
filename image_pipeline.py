@@ -26,6 +26,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -35,6 +36,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+from image_augmentations import build_train_augmentation_steps
+from image_loss_variants import SoftTargetTrainingLoss
 from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch import nn
@@ -93,7 +96,12 @@ class ImageExperimentConfig:
     seed: int = 42
     folds: list[str] | None = None
     normalization: str = "imagenet"
+    augmentation: str = "basic"
     classifier_dropout: float = 0.0
+    lambda_reg: float = 0.0
+    prob_regularizer: str = "none"
+    prob_regularizer_weight: float = 0.0
+    entropy_bonus_weight: float = 0.0
     amp: bool = True
 
 
@@ -242,6 +250,18 @@ class ImageSoftClassifier(nn.Module):
         if features.ndim > 2: # if the encoder doesn't already pool to (batch_size, features)
             features = torch.flatten(features, start_dim=1)
         return self.head(features)
+    
+class RegularizerDare(nn.Module):
+    def __init__(self, lambda_reg: float = 0.01, epsilon: float = 1e-12):
+        super().__init__()
+        self.lambda_reg = lambda_reg
+        self.epsilon = epsilon
+
+    def forward(self, model: nn.Module) -> torch.Tensor:
+        total_loss = torch.zeros((), device=next(model.parameters()).device)
+        for param in model.parameters():
+            total_loss += (param.square() + self.epsilon).log2().sum()
+        return total_loss * self.lambda_reg
 
 
 def list_available_encoders() -> list[str]:
@@ -364,58 +384,19 @@ def run_dataset_experiment(
         model_files: list[str] = []
 
         for member_index in range(config.ensemble_size):
-            member_seed = fold_seed + 97 * member_index
-            member_dir = fold_dir / f"member_{member_index:02d}"
-            member_dir.mkdir(parents=True, exist_ok=True)
-            member_summary = load_member_summary_if_complete(member_dir)
-
-            if member_summary is None:
-                model, history = train_single_model(
-                    train_records=train_records,
-                    val_records=val_records,
-                    num_classes=len(class_names),
-                    config=config,
-                    seed=member_seed,
-                    checkpoint_dir=member_dir,
-                    normalization_stats=normalization_stats,
-                )
-
-                probabilities, targets, image_paths = predict_records(
-                    model=model,
-                    records=test_records,
-                    config=config,
-                    normalization_stats=normalization_stats,
-                )
-
-                member_loss = mean_cross_entropy(targets, probabilities)
-                model_path = member_dir / "model.pt"
-                torch.save(model.state_dict(), model_path)
-
-                member_prediction_path = member_dir / "predictions.csv"
-                export_prediction_frame(
-                    output_path=member_prediction_path,
-                    image_paths=image_paths,
-                    targets=targets,
-                    probabilities=probabilities,
-                    class_names=class_names,
-                    fold_name=test_fold,
-                    history=history,
-                )
-                member_summary = {
-                    "member_index": member_index,
-                    "member_seed": member_seed,
-                    "cross_entropy": member_loss,
-                    "model_file": str(model_path),
-                    "prediction_file": str(member_prediction_path),
-                    "history_file": str(member_prediction_path.with_name("history.json")),
-                }
-                write_json(member_dir / "summary.json", member_summary)
-                cleanup_training_state(member_dir)
-            else:
-                probabilities, targets, image_paths = load_prediction_frame(
-                    Path(member_summary["prediction_file"]),
-                    class_names=class_names,
-                )
+            probabilities, targets, member_summary, image_paths = train_single_member(
+                member_index=member_index,
+                fold_seed=fold_seed,
+                fold_dir=fold_dir,
+                test_fold=test_fold,
+                train_records=train_records,
+                val_records=val_records,
+                test_records=test_records,
+                class_names=class_names,
+                dataset_name=dataset_name,
+                config=config,
+                normalization_stats=normalization_stats,
+            )
 
             member_probabilities.append(probabilities)
             member_losses.append(float(member_summary["cross_entropy"]))
@@ -472,10 +453,81 @@ def run_dataset_experiment(
     return result
 
 
+def train_single_member(
+    member_index: int,
+    fold_seed: int,
+    fold_dir: Path,
+    test_fold: str,
+    train_records: list[ImageRecord],
+    val_records: list[ImageRecord],
+    test_records: list[ImageRecord],
+    class_names: list[str],
+    dataset_name: str,
+    config: ImageExperimentConfig,
+    normalization_stats: NormalizationStats,
+) -> tuple[np.ndarray, np.ndarray, dict[str, any], list[str]]:
+    member_seed = fold_seed + 97 * member_index
+    member_dir = fold_dir / f"member_{member_index:02d}"
+    member_dir.mkdir(parents=True, exist_ok=True)
+    member_summary = load_member_summary_if_complete(member_dir)
+
+    if member_summary is None:
+        model, history = train_single_model(
+            train_records=train_records,
+            val_records=val_records,
+            num_classes=len(class_names),
+            dataset_name=dataset_name,
+            config=config,
+            seed=member_seed,
+            checkpoint_dir=member_dir,
+            normalization_stats=normalization_stats,
+        )
+
+        probabilities, targets, image_paths = predict_records(
+            model=model,
+            records=test_records,
+            dataset_name=dataset_name,
+            config=config,
+            normalization_stats=normalization_stats,
+        )
+
+        member_loss = mean_cross_entropy(targets, probabilities)
+        model_path = member_dir / "model.pt"
+        atomic_torch_save(model.state_dict(), model_path)
+
+        member_prediction_path = member_dir / "predictions.csv"
+        export_prediction_frame(
+            output_path=member_prediction_path,
+            image_paths=image_paths,
+            targets=targets,
+            probabilities=probabilities,
+            class_names=class_names,
+            fold_name=test_fold,
+            history=history,
+        )
+        member_summary = {
+            "member_index": member_index,
+            "member_seed": member_seed,
+            "cross_entropy": member_loss,
+            "model_file": str(model_path),
+            "prediction_file": str(member_prediction_path),
+            "history_file": str(member_prediction_path.with_name("history.json")),
+        }
+        write_json(member_dir / "summary.json", member_summary)
+        cleanup_training_state(member_dir)
+    else:
+        probabilities, targets, image_paths = load_prediction_frame(
+            Path(member_summary["prediction_file"]),
+            class_names=class_names,
+        )
+    return probabilities, targets, member_summary, image_paths
+
+
 def train_single_model(
     train_records: list[ImageRecord],
     val_records: list[ImageRecord],
     num_classes: int,
+    dataset_name: str,
     config: ImageExperimentConfig,
     seed: int,
     checkpoint_dir: Path,
@@ -486,7 +538,12 @@ def train_single_model(
     train_loader = make_dataloader(
         data_root=config.data_root,
         records=train_records,
-        transform=build_transform(config, train=True, normalization_stats=normalization_stats),
+        transform=build_transform(
+            config,
+            dataset_name=dataset_name,
+            train=True,
+            normalization_stats=normalization_stats,
+        ),
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
@@ -495,7 +552,12 @@ def train_single_model(
     val_loader = make_dataloader(
         data_root=config.data_root,
         records=val_records,
-        transform=build_transform(config, train=False, normalization_stats=normalization_stats),
+        transform=build_transform(
+            config,
+            dataset_name=dataset_name,
+            train=False,
+            normalization_stats=normalization_stats,
+        ),
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
@@ -515,9 +577,14 @@ def train_single_model(
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-    criterion = SoftTargetCrossEntropy()
+    criterion = SoftTargetTrainingLoss(
+        prob_regularizer=config.prob_regularizer,
+        prob_regularizer_weight=config.prob_regularizer_weight,
+        entropy_bonus_weight=config.entropy_bonus_weight,
+    )
     use_amp = config.amp and config.device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    regularizer = RegularizerDare(lambda_reg=config.lambda_reg) if config.lambda_reg > 0 else None
 
     best_state = copy.deepcopy(model.state_dict())
     best_val_loss = math.inf
@@ -547,7 +614,9 @@ def train_single_model(
             config.device,
             optimizer,
             scaler=scaler,
+            regularizer=regularizer,
             use_amp=use_amp,
+            epoch_index=epoch_index,
         )
         val_loss = run_epoch(
             model,
@@ -566,7 +635,7 @@ def train_single_model(
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
-        torch.save(
+        atomic_torch_save(
             {
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
@@ -592,13 +661,19 @@ def train_single_model(
 def predict_records(
     model: nn.Module,
     records: list[ImageRecord],
+    dataset_name: str,
     config: ImageExperimentConfig,
     normalization_stats: NormalizationStats,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     loader = make_dataloader(
         data_root=config.data_root,
         records=records,
-        transform=build_transform(config, train=False, normalization_stats=normalization_stats),
+        transform=build_transform(
+            config,
+            dataset_name=dataset_name,
+            train=False,
+            normalization_stats=normalization_stats,
+        ),
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
@@ -618,7 +693,12 @@ def predict_records(
                 enabled=config.amp and config.device.startswith("cuda"),
             ):
                 logits = model(images.to(config.device))
-            probabilities = torch.softmax(logits, dim=1).cpu().numpy()
+            probabilities = (
+                torch.softmax(logits.float(), dim=1)
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
             all_probabilities.append(probabilities)
             all_targets.append(targets.numpy())
             all_paths.extend(image_paths)
@@ -652,6 +732,7 @@ def split_train_validation_records(
 
 def build_transform(
     config: ImageExperimentConfig,
+    dataset_name: str,
     train: bool,
     normalization_stats: NormalizationStats,
 ) -> transforms.Compose:
@@ -659,7 +740,13 @@ def build_transform(
 
     steps: list[Any] = []
     if train:
-        steps.append(transforms.RandomHorizontalFlip())
+        steps.extend(
+            build_train_augmentation_steps(
+                mode=config.augmentation,
+                dataset_name=dataset_name,
+                input_size=input_size,
+            )
+        )
 
     steps.append(transforms.Resize((input_size, input_size)))
 
@@ -729,12 +816,14 @@ def mean_cross_entropy(targets: np.ndarray, probabilities: np.ndarray) -> float:
 def cross_entropy_per_sample(
     targets: np.ndarray, probabilities: np.ndarray
 ) -> np.ndarray:
-    clipped = np.clip(probabilities, 1e-8, 1.0)
-    return -(targets * np.log(clipped)).sum(axis=1)
+    safe_targets = np.asarray(targets, dtype=np.float64)
+    safe_probabilities = np.asarray(probabilities, dtype=np.float64)
+    clipped = np.clip(safe_probabilities, 1e-8, 1.0)
+    return -(safe_targets * np.log(clipped)).sum(axis=1)
 
 
 def entropy_per_sample(distributions: np.ndarray) -> np.ndarray:
-    clipped = np.clip(distributions, 1e-8, 1.0)
+    clipped = np.clip(np.asarray(distributions, dtype=np.float64), 1e-8, 1.0)
     return -(clipped * np.log(clipped)).sum(axis=1)
 
 
@@ -765,6 +854,16 @@ def cleanup_training_state(member_dir: Path) -> None:
         training_state_path.unlink()
 
 
+def atomic_torch_save(payload: Any, output_path: Path) -> None:
+    temp_path = output_path.with_name(f"{output_path.name}.tmp")
+    try:
+        torch.save(payload, temp_path)
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -773,7 +872,9 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     *,
     scaler: torch.amp.GradScaler | None = None,
+    regularizer: RegularizerDare | None = None,
     use_amp: bool = False,
+    epoch_index: int | None = None,
 ) -> float:
     is_training = optimizer is not None
     model.train(mode=is_training)
@@ -792,6 +893,8 @@ def run_epoch(
             ):
                 logits = model(images)
                 loss = criterion(logits, targets)
+                if regularizer is not None and epoch_index is not None:
+                    loss = loss - min(1.0, epoch_index / 10) * regularizer(model)
 
             if is_training:
                 optimizer.zero_grad(set_to_none=True)
@@ -870,7 +973,12 @@ def serialize_config(config: ImageExperimentConfig) -> dict[str, Any]:
         "seed": config.seed,
         "folds": config.folds,
         "normalization": config.normalization,
+        "augmentation": config.augmentation,
         "classifier_dropout": config.classifier_dropout,
+        "lambda_reg": config.lambda_reg,
+        "prob_regularizer": config.prob_regularizer,
+        "prob_regularizer_weight": config.prob_regularizer_weight,
+        "entropy_bonus_weight": config.entropy_bonus_weight,
         "amp": config.amp,
     }
 
@@ -884,6 +992,26 @@ def build_run_name(config: ImageExperimentConfig) -> str:
         if config.normalization == "imagenet"
         else f"_norm-{sanitize_path_token(config.normalization)}"
     )
+    augmentation_part = (
+        ""
+        if config.augmentation == "basic"
+        else f"_aug-{sanitize_path_token(config.augmentation)}"
+    )
+    regularizer_part = (
+        ""
+        if config.lambda_reg <= 0
+        else f"_reg-{sanitize_path_token(f'{config.lambda_reg:g}')}"
+    )
+    prob_regularizer_part = (
+        ""
+        if config.prob_regularizer == "none" or config.prob_regularizer_weight <= 0
+        else f"_preg-{sanitize_path_token(config.prob_regularizer)}-{sanitize_path_token(f'{config.prob_regularizer_weight:g}')}"
+    )
+    entropy_bonus_part = (
+        ""
+        if config.entropy_bonus_weight <= 0
+        else f"_ent-{sanitize_path_token(f'{config.entropy_bonus_weight:g}')}"
+    )
     readable = (
         f"{config.encoder_name}_{mode}_{pretrained}"
         f"_ens{config.ensemble_size}"
@@ -892,7 +1020,11 @@ def build_run_name(config: ImageExperimentConfig) -> str:
         f"_seed{config.seed}"
         f"_{fold_part}"
         f"{'_amp' if config.amp else '_fp32'}"
+        f"{regularizer_part}"
+        f"{prob_regularizer_part}"
+        f"{entropy_bonus_part}"
         f"{normalization_part}"
+        f"{augmentation_part}"
     )
     fingerprint = hashlib.sha256(
         json.dumps(serialize_config_for_run_name(config), sort_keys=True).encode("utf-8")
@@ -904,6 +1036,8 @@ def serialize_config_for_run_name(config: ImageExperimentConfig) -> dict[str, An
     payload = serialize_config(config)
     if config.normalization == "imagenet":
         payload.pop("normalization", None)
+    if config.augmentation == "basic":
+        payload.pop("augmentation", None)
     return payload
 
 
